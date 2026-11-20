@@ -32,10 +32,10 @@ impl App {
             }
         });
         if !snap.per_app_net && self.net_tab <= 1 {
-            egui::Frame::new().fill(Color32::from_rgb(40, 32, 18)).stroke(Stroke::new(1.0, WARN.gamma_multiply(0.35))).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 9)).show(ui, |ui| {
+            egui::Frame::new().fill(WARN().gamma_multiply(0.12)).stroke(Stroke::new(1.0, WARN().gamma_multiply(0.35))).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 9)).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(I::SHIELD_WARNING).color(WARN).size(16.0));
-                    ui.label(RichText::new(if self.elevated { "Starting the network monitor…" } else { "Per-app speeds need admin rights. The UAC prompt was declined; restart Sentinel and accept it." }).color(TEXT));
+                    ui.label(RichText::new(I::SHIELD_WARNING).color(WARN()).size(16.0));
+                    ui.label(RichText::new(if self.elevated { "Starting the network monitor…" } else { "Per-app speeds need admin rights. The UAC prompt was declined; restart Sentinel and accept it." }).color(TEXT()));
                 });
             });
             ui.add_space(10.0);
@@ -84,7 +84,7 @@ impl App {
         };
         let w = ui.available_width();
         let rect = ui.allocate_exact_size(vec2(w, 170.0), Sense::hover()).0;
-        graph::graph(ui, rect, &[Series { data: &recv, color: C_NET, label: "Download" }, Series { data: &send, color: CYAN, label: "Upload" }], &Opts { max: None, fmt: &|v| fmt::bits(v as f64), offset, grid: true, rounded: true, interval: snap.interval.max(0.25) });
+        graph::graph(ui, rect, &[Series { data: &recv, color: C_NET(), label: "Download" }, Series { data: &send, color: CYAN(), label: "Upload" }], &Opts { max: None, fmt: &|v| fmt::bits(v as f64), offset, grid: true, rounded: true, interval: snap.interval.max(0.25) });
         ui.add_space(12.0);
 
         // Per-app table
@@ -94,9 +94,8 @@ impl App {
         } else {
             apps.sort_by(|a, b| b.conns.cmp(&a.conns));
         }
-        let ctx = ui.ctx().clone();
         label_caps(ui, if snap.per_app_net { "Apps using the network" } else { "Apps with open connections" });
-        egui::Frame::new().fill(CARD).stroke(Stroke::new(1.0, BORDER_SOFT)).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+        egui::Frame::new().fill(CARD()).stroke(Stroke::new(1.0, BORDER_SOFT())).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             let max_rate = apps.iter().map(|p| p.net_rate()).fold(1.0, f64::max);
             TableBuilder::new(ui)
                 .id_salt("netapps")
@@ -113,7 +112,7 @@ impl App {
                 .header(28.0, |mut h| {
                     for t in ["App", "Download", "Upload", "Activity", "Session total", "Connections"] {
                         h.col(|ui| {
-                            ui.label(RichText::new(t).font(bold(11.5)).color(MUTED));
+                            ui.label(RichText::new(t).font(bold(11.5)).color(MUTED()));
                         });
                     }
                 })
@@ -121,30 +120,29 @@ impl App {
                     body.rows(34.0, apps.len(), |mut row| {
                         let p = apps[row.index()];
                         row.col(|ui| {
-                            let tex = p.path.as_deref().and_then(|path| self.tex(&ctx, path));
                             let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                            paint_icon(ui, r, tex.as_ref(), I::APP_WINDOW);
+                            self.paint_proc_icon(ui, r, p);
                             let name = self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| p.name.clone());
                             ui.add(egui::Label::new(name).truncate());
-                            ui.label(RichText::new(p.pid.to_string()).size(11.0).color(FAINT));
+                            ui.label(RichText::new(p.pid.to_string()).size(11.0).color(FAINT()));
                             if self.cfg.blocked_apps.iter().any(|b| Some(b.as_str()) == p.path.as_deref()) {
-                                pill(ui, "Blocked", ORANGE);
+                                pill(ui, "Blocked", ORANGE());
                             }
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(if snap.per_app_net { fmt::rate(p.net_recv) } else { "—".into() }).color(C_NET));
+                            ui.label(RichText::new(if snap.per_app_net { fmt::rate(p.net_recv) } else { "—".into() }).color(C_NET()));
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(if snap.per_app_net { fmt::rate(p.net_send) } else { "—".into() }).color(CYAN));
+                            ui.label(RichText::new(if snap.per_app_net { fmt::rate(p.net_send) } else { "—".into() }).color(CYAN()));
                         });
                         row.col(|ui| {
-                            bar(ui, (p.net_rate() / max_rate) as f32, C_NET, 140.0, 6.0);
+                            bar(ui, (p.net_rate() / max_rate) as f32, C_NET(), 140.0, 6.0);
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(if snap.per_app_net { fmt::bytes(p.net_total) } else { "—".into() }).color(MUTED));
+                            ui.label(RichText::new(if snap.per_app_net { fmt::bytes(p.net_total) } else { "—".into() }).color(MUTED()));
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(p.conns.to_string()).color(MUTED));
+                            ui.label(RichText::new(p.conns.to_string()).color(MUTED()));
                         });
                         let resp = row.response();
                         if resp.double_clicked() {
@@ -167,7 +165,7 @@ impl App {
                                     ui.close();
                                 }
                             }
-                            if ui.button(RichText::new(format!("{}  End task", I::X_CIRCLE)).color(BAD)).clicked() {
+                            if ui.button(RichText::new(format!("{}  End task", I::X_CIRCLE)).color(BAD())).clicked() {
                                 acts.push(NetAct::Kill(p.pid, p.create_time, p.name.clone()));
                                 ui.close();
                             }
@@ -178,7 +176,6 @@ impl App {
     }
 
     fn net_connections(&mut self, ui: &mut Ui, snap: &crate::sampler::Snapshot, acts: &mut Vec<NetAct>) {
-        let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
             field(ui, egui::Id::unique("net-search"), I::MAGNIFYING_GLASS, &mut self.net_search, "Filter by app, PID, IP, host or port (e.g. 443)…", 420.0);
             chip(ui, &mut self.net_hide_listen, "Hide listening", None);
@@ -207,8 +204,8 @@ impl App {
             })
             .collect();
         conns.sort_by(|a, b| (b.send_rate + b.recv_rate).total_cmp(&(a.send_rate + a.recv_rate)).then((a.state != 5).cmp(&(b.state != 5))).then(a.pid.cmp(&b.pid)));
-        ui.label(RichText::new(format!("{} of {} sockets", conns.len(), snap.conns.len())).size(12.0).color(FAINT));
-        egui::Frame::new().fill(CARD).stroke(Stroke::new(1.0, BORDER_SOFT)).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+        ui.label(RichText::new(format!("{} of {} sockets", conns.len(), snap.conns.len())).size(12.0).color(FAINT()));
+        egui::Frame::new().fill(CARD()).stroke(Stroke::new(1.0, BORDER_SOFT())).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             TableBuilder::new(ui)
                 .id_salt("conns")
                 .striped(false)
@@ -226,7 +223,7 @@ impl App {
                 .header(28.0, |mut h| {
                     for t in ["App", "Proto", "Local", "Remote", "State", "Download", "Upload"] {
                         h.col(|ui| {
-                            ui.label(RichText::new(t).font(bold(11.5)).color(MUTED));
+                            ui.label(RichText::new(t).font(bold(11.5)).color(MUTED()));
                         });
                     }
                 })
@@ -235,9 +232,11 @@ impl App {
                         let c = conns[row.index()];
                         let p = by_pid.get(&c.pid).copied();
                         row.col(|ui| {
-                            let tex = p.and_then(|p| p.path.as_deref()).and_then(|path| self.tex(&ctx, path));
                             let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                            paint_icon(ui, r, tex.as_ref(), I::GEAR_SIX);
+                            match p {
+                                Some(p) => self.paint_proc_icon(ui, r, p),
+                                None => paint_icon(ui, r, None, I::GEAR_SIX),
+                            }
                             ui.add(egui::Label::new(p.map(|p| p.name.clone()).unwrap_or_else(|| if c.pid == 4 { "System".into() } else { format!("PID {}", c.pid) })).truncate());
                         });
                         row.col(|ui| {
@@ -246,39 +245,39 @@ impl App {
                                 (Proto::Tcp, true) => "TCP6",
                                 (Proto::Udp, false) => "UDP",
                                 (Proto::Udp, true) => "UDP6",
-                            }).size(12.0).color(MUTED));
+                            }).size(12.0).color(MUTED()));
                         });
                         row.col(|ui| {
-                            ui.add(egui::Label::new(RichText::new(c.local.to_string()).size(12.0).color(MUTED)).truncate());
+                            ui.add(egui::Label::new(RichText::new(c.local.to_string()).size(12.0).color(MUTED())).truncate());
                         });
                         row.col(|ui| match c.remote {
                             Some(r) if !r.ip().is_unspecified() => {
                                 let host = self.rdns.get(r.ip());
                                 ui.add(egui::Label::new(RichText::new(format!("{}:{}", r.ip(), r.port())).size(12.0)).truncate());
                                 if let Some(h) = host {
-                                    ui.add(egui::Label::new(RichText::new(h).size(11.5).color(FAINT)).truncate());
+                                    ui.add(egui::Label::new(RichText::new(h).size(11.5).color(FAINT())).truncate());
                                 }
                             }
                             _ => {
-                                ui.label(RichText::new(if c.proto == Proto::Tcp { "—" } else { "any" }).color(FAINT));
+                                ui.label(RichText::new(if c.proto == Proto::Tcp { "—" } else { "any" }).color(FAINT()));
                             }
                         });
                         row.col(|ui| {
                             let st = if c.proto == Proto::Udp { "" } else { tcp_state(c.state) };
                             let col = match c.state {
-                                5 => GOOD,
-                                2 => BLUE,
-                                _ => FAINT,
+                                5 => GOOD(),
+                                2 => BLUE(),
+                                _ => FAINT(),
                             };
                             if !st.is_empty() {
                                 ui.label(RichText::new(st).size(12.0).color(col));
                             }
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(if c.recv_rate > 0.0 { fmt::rate(c.recv_rate) } else { String::new() }).size(12.0).color(C_NET));
+                            ui.label(RichText::new(if c.recv_rate > 0.0 { fmt::rate(c.recv_rate) } else { String::new() }).size(12.0).color(C_NET()));
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(if c.send_rate > 0.0 { fmt::rate(c.send_rate) } else { String::new() }).size(12.0).color(CYAN));
+                            ui.label(RichText::new(if c.send_rate > 0.0 { fmt::rate(c.send_rate) } else { String::new() }).size(12.0).color(CYAN()));
                         });
                         let resp = row.response();
                         resp.context_menu(|ui| {
@@ -297,7 +296,7 @@ impl App {
                                     acts.push(NetAct::Lookup(r.ip().to_string()));
                                     ui.close();
                                 }
-                                if c.proto == Proto::Tcp && c.local.is_ipv4() && ui.button(RichText::new(format!("{}  Close connection", I::LINK_BREAK)).color(BAD)).clicked() {
+                                if c.proto == Proto::Tcp && c.local.is_ipv4() && ui.button(RichText::new(format!("{}  Close connection", I::LINK_BREAK)).color(BAD())).clicked() {
                                     acts.push(NetAct::Close(c.clone()));
                                     ui.close();
                                 }
@@ -335,44 +334,40 @@ impl App {
                 card().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(if a.kind == "Wi-Fi" { I::WIFI_HIGH } else { I::GLOBE }).size(22.0).color(C_NET));
+                        ui.label(RichText::new(if a.kind == "Wi-Fi" { I::WIFI_HIGH } else { I::GLOBE }).size(22.0).color(C_NET()));
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.label(RichText::new(&a.alias).font(bold(15.0)));
-                            ui.label(RichText::new(format!("{}  ·  {}  ·  {}", a.kind, a.description, fmt::link_speed(a.speed))).size(12.0).color(MUTED));
+                            ui.label(RichText::new(format!("{}  ·  {}  ·  {}", a.kind, a.description, fmt::link_speed(a.speed))).size(12.0).color(MUTED()));
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(format!("↑ {}", fmt::bits(a.send_rate))).font(bold(13.0)).color(CYAN));
-                            ui.label(RichText::new(format!("↓ {}", fmt::bits(a.recv_rate))).font(bold(13.0)).color(C_NET));
+                            ui.label(RichText::new(format!("↑ {}", fmt::bits(a.send_rate))).font(bold(13.0)).color(CYAN()));
+                            ui.label(RichText::new(format!("↓ {}", fmt::bits(a.recv_rate))).font(bold(13.0)).color(C_NET()));
                         });
                     });
                     ui.add_space(6.0);
                     let rect = ui.allocate_exact_size(vec2(ui.available_width(), 110.0), Sense::hover()).0;
                     let e = VecDeque::new();
-                    graph::graph(ui, rect, &[Series { data: r.get(&a.alias).unwrap_or(&e), color: C_NET, label: "Download" }, Series { data: s.get(&a.alias).unwrap_or(&e), color: CYAN, label: "Upload" }], &Opts { max: None, fmt: &|v| fmt::bits(v as f64), offset, grid: true, rounded: true, interval: snap.interval.max(0.25) });
-                    ui.add_space(6.0);
-                    let rows: Vec<(&str, String)> = vec![
-                        ("IPv4", a.ipv4.join(", ")),
-                        ("IPv6", a.ipv6.join(", ")),
+                    graph::graph(ui, rect, &[Series { data: r.get(&a.alias).unwrap_or(&e), color: C_NET(), label: "Download" }, Series { data: s.get(&a.alias).unwrap_or(&e), color: CYAN(), label: "Upload" }], &Opts { max: None, fmt: &|v| fmt::bits(v as f64), offset, grid: true, rounded: true, interval: snap.interval.max(0.25) });
+                    ui.add_space(10.0);
+                    let link_v6: Vec<&String> = a.ipv6.iter().filter(|x| !x.starts_with("fe80")).collect();
+                    let tiles: Vec<(&str, String)> = vec![
+                        ("IPv4 address", a.ipv4.join(", ")),
                         ("Gateway", a.gateways.join(", ")),
-                        ("DNS servers", a.dns.join(", ")),
+                        ("DNS servers", a.dns.iter().filter(|d| !d.starts_with("fe80")).cloned().collect::<Vec<_>>().join(", ")),
+                        ("IPv6 address", link_v6.first().map(|x| x.to_string()).or_else(|| a.ipv6.first().cloned()).unwrap_or_default()),
                         ("MAC address", a.mac.clone()),
-                        ("Since boot", format!("↓ {}   ↑ {}", fmt::bytes(a.in_octets), fmt::bytes(a.out_octets))),
+                        ("Link speed", fmt::link_speed(a.speed)),
+                        ("Downloaded since boot", fmt::bytes(a.in_octets)),
+                        ("Uploaded since boot", fmt::bytes(a.out_octets)),
+                        ("Packets in / out per s", format!("{} / {}", fmt::count(a.in_pps), fmt::count(a.out_pps))),
+                        ("Errors in / out", format!("{} / {}", a.in_errors, a.out_errors)),
+                        ("Discards in / out", format!("{} / {}", a.in_discards, a.out_discards)),
                     ];
-                    egui::Grid::new(("adg", &a.alias)).num_columns(3).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
-                        for (k, v) in rows {
-                            if v.is_empty() {
-                                continue;
-                            }
-                            ui.label(RichText::new(k).color(FAINT));
-                            ui.add(egui::Label::new(RichText::new(&v).color(TEXT)).wrap());
-                            if ui.add(egui::Label::new(RichText::new(I::COPY).color(FAINT)).sense(Sense::click())).on_hover_text("Copy").clicked() {
-                                ctx.copy_text(v.clone());
-                                self.toast(ToastKind::Info, "Copied to clipboard");
-                            }
-                            ui.end_row();
-                        }
-                    });
+                    if let Some(v) = copy_tiles(ui, &a.alias, &tiles) {
+                        ctx.copy_text(v);
+                        self.toast(ToastKind::Info, "Copied to clipboard");
+                    }
                 });
                 ui.add_space(10.0);
             }
@@ -388,7 +383,7 @@ impl App {
         targets.extend(self.cfg.latency_targets.iter().cloned());
         *self.latency.targets.lock().unwrap() = targets.clone();
         let series = self.latency.series.lock().unwrap().clone();
-        ui.label(RichText::new("Pings each target once a second while this page is open. A spike on \"Internet\" but not on \"Your router\" means the problem is outside your home network.").size(12.5).color(MUTED));
+        ui.label(RichText::new("Pings each target once a second while this page is open. A spike on \"Internet\" but not on \"Your router\" means the problem is outside your home network.").size(12.5).color(MUTED()));
         ui.add_space(8.0);
         let mut remove: Option<String> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -399,38 +394,45 @@ impl App {
                     let last = s.and_then(|s| s.last());
                     let loss = s.map(|s| s.loss_pct()).unwrap_or(0.0);
                     let color = match last {
-                        None if s.is_some_and(|s| !s.samples.is_empty()) => BAD,
-                        Some(v) if v < 40.0 => GOOD,
-                        Some(v) if v < 100.0 => WARN,
-                        Some(_) => BAD,
-                        None => FAINT,
+                        None if s.is_some_and(|s| !s.samples.is_empty()) => BAD(),
+                        Some(v) if v < 40.0 => GOOD(),
+                        Some(v) if v < 100.0 => WARN(),
+                        Some(_) => BAD(),
+                        None => FAINT(),
                     };
                     ui.horizontal(|ui| {
+                        ui.set_min_height(38.0);
                         ui.label(RichText::new("●").color(color));
-                        ui.label(RichText::new(label).font(bold(14.0)));
-                        ui.label(RichText::new(target).color(FAINT));
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(RichText::new(label).font(bold(14.5)));
+                            ui.label(RichText::new(target).size(12.0).color(FAINT()));
+                        });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if label != "Your router" && ui.add(egui::Label::new(RichText::new(I::X).color(FAINT)).sense(Sense::click())).on_hover_text("Remove").clicked() {
+                            if label == "Your router" {
+                                ui.add_space(14.0); // keeps stats aligned with removable cards
+                            } else if ui.add(egui::Label::new(RichText::new(I::X).color(FAINT())).sense(Sense::click())).on_hover_text("Remove").clicked() {
                                 remove = Some(target.clone());
                             }
                             ui.add_space(8.0);
-                            stat_inline(ui, "Loss", &format!("{loss:.0}%"), if loss > 2.0 { BAD } else { MUTED });
-                            stat_inline(ui, "Jitter", &s.and_then(|s| s.jitter()).map(|v| format!("{v:.1} ms")).unwrap_or("—".into()), MUTED);
-                            stat_inline(ui, "Average", &s.and_then(|s| s.avg()).map(|v| format!("{v:.0} ms")).unwrap_or("—".into()), MUTED);
+                            stat_inline(ui, "Loss", &format!("{loss:.0}%"), if loss > 2.0 { BAD() } else { MUTED() });
+                            stat_inline(ui, "Jitter", &s.and_then(|s| s.jitter()).map(|v| format!("{v:.1} ms")).unwrap_or("—".into()), MUTED());
+                            stat_inline(ui, "Average", &s.and_then(|s| s.avg()).map(|v| format!("{v:.0} ms")).unwrap_or("—".into()), MUTED());
                             stat_inline(ui, "Now", &last.map(|v| format!("{v:.0} ms")).unwrap_or(if s.is_some_and(|s| !s.samples.is_empty()) { "timeout".into() } else { "…".into() }), color);
                         });
                     });
+                    ui.add_space(6.0);
                     let rect = ui.allocate_exact_size(vec2(ui.available_width(), 90.0), Sense::hover()).0;
                     let data: VecDeque<f32> = s.map(|s| s.samples.iter().map(|v| v.unwrap_or(0.0)).collect()).unwrap_or_default();
                     // Mark lost packets in red under the graph.
-                    graph::graph(ui, rect, &[Series { data: &data, color: C_NET, label: "" }], &Opts { max: None, fmt: &|v| format!("{v:.0} ms"), offset: 0.0, grid: true, rounded: true, interval: 1.0 });
+                    graph::graph(ui, rect, &[Series { data: &data, color: C_NET(), label: "" }], &Opts { max: None, fmt: &|v| format!("{v:.0} ms"), offset: 0.0, grid: true, rounded: true, interval: 1.0 });
                     if let Some(s) = s {
                         let step = rect.width() / (crate::sampler::HIST as f32 - 2.0);
                         let n = s.samples.len();
                         for (i, v) in s.samples.iter().enumerate() {
                             if v.is_none() {
                                 let x = rect.right() - (n - 1 - i) as f32 * step;
-                                ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(x - step / 2.0, rect.bottom() - 4.0), egui::pos2(x + step / 2.0, rect.bottom())), CornerRadius::ZERO, BAD);
+                                ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(x - step / 2.0, rect.bottom() - 4.0), egui::pos2(x + step / 2.0, rect.bottom())), CornerRadius::ZERO, BAD());
                             }
                         }
                     }
@@ -456,7 +458,7 @@ impl App {
     }
 
     fn net_blocked(&mut self, ui: &mut Ui) {
-        ui.label(RichText::new("Apps blocked from the internet with Windows Firewall rules created by Sentinel. Right-click any app in Processes or Network to block it.").size(12.5).color(MUTED));
+        ui.label(RichText::new("Apps blocked from the internet with Windows Firewall rules created by Sentinel. Right-click any app in Processes or Network to block it.").size(12.5).color(MUTED()));
         ui.add_space(8.0);
         if self.cfg.blocked_apps.is_empty() {
             empty_state(ui, I::PROHIBIT, "Nothing blocked", "Blocked apps show up here.");
@@ -474,7 +476,7 @@ impl App {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.label(RichText::new(std::path::Path::new(&path).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()).font(bold(13.5)));
-                        ui.label(RichText::new(&path).size(11.5).color(FAINT));
+                        ui.label(RichText::new(&path).size(11.5).color(FAINT()));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if button(ui, Btn::Ghost, I::CHECK, "Allow again", true).clicked() {
@@ -491,11 +493,44 @@ impl App {
     }
 }
 
+/// Small "label over value" block with a fixed size, safe in any layout direction.
 fn stat_inline(ui: &mut Ui, k: &str, v: &str, color: Color32) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.label(RichText::new(k).size(10.5).color(FAINT));
-        ui.label(RichText::new(v).font(bold(13.0)).color(color));
-    });
-    ui.add_space(10.0);
+    let (r, _) = ui.allocate_exact_size(vec2(96.0, 36.0), Sense::hover());
+    let p = ui.painter();
+    p.text(r.left_top(), egui::Align2::LEFT_TOP, k, egui::FontId::proportional(11.0), FAINT());
+    p.text(r.left_top() + vec2(0.0, 15.0), egui::Align2::LEFT_TOP, v, bold(15.0), color);
+}
+
+/// Grid of info tiles (label + value). Clicking a tile returns its value for copying.
+fn copy_tiles(ui: &mut Ui, salt: &str, items: &[(&str, String)]) -> Option<String> {
+    let mut out = None;
+    let items: Vec<&(&str, String)> = items.iter().filter(|(_, v)| !v.trim().is_empty()).collect();
+    let w = ui.available_width();
+    let cols = ((w / 230.0).floor() as usize).clamp(1, 4);
+    let cw = (w - (cols - 1) as f32 * 8.0) / cols as f32;
+    for (ri, chunk) in items.chunks(cols).enumerate() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            for (ci, (k, v)) in chunk.iter().enumerate() {
+                let (r, _) = ui.allocate_exact_size(vec2(cw, 54.0), Sense::hover());
+                let resp = ui.interact(r, ui.scope_id().with((salt, ri, ci)), Sense::click());
+                let hover = resp.hovered();
+                ui.painter().rect(r, CornerRadius::same(10), if hover { CARD_HI() } else { FIELD() }, Stroke::new(1.0, BORDER_SOFT()), egui::StrokeKind::Inside);
+                ui.painter().text(r.left_top() + vec2(12.0, 9.0), egui::Align2::LEFT_TOP, *k, egui::FontId::proportional(11.5), FAINT());
+                if hover {
+                    ui.painter().text(r.right_top() + vec2(-12.0, 9.0), egui::Align2::RIGHT_TOP, I::COPY, egui::FontId::proportional(12.0), MUTED());
+                }
+                let galley = ui.painter().layout_no_wrap(v.clone(), bold(14.0), TEXT());
+                let clipped = galley.size().x > r.width() - 24.0;
+                ui.painter().with_clip_rect(r.shrink(8.0)).galley(r.left_top() + vec2(12.0, 27.0), galley, TEXT());
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let resp = if clipped { resp.on_hover_text(v.as_str()) } else { resp.on_hover_text("Click to copy") };
+                if resp.clicked() {
+                    out = Some(v.clone());
+                }
+            }
+        });
+        ui.add_space(4.0);
+    }
+    out
 }

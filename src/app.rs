@@ -118,6 +118,10 @@ pub struct App {
     pub expanded_groups: HashSet<String>,
     pub tree_collapsed: HashSet<Key>,
     pub sort_cache: std::cell::RefCell<crate::ui_procs::SortCache>,
+    pub palette: crate::palette::Palette,
+    pub overlay_styled: bool,
+    /// Exe name to re-select once its process shows up (selection survives restarts).
+    pub pending_select: Option<String>,
     pub only_hung: bool,
     pub only_suspended: bool,
     pub scroll_to_sel: bool,
@@ -127,6 +131,8 @@ pub struct App {
     // performance
     pub perf_sel: usize,
     pub per_core: bool,
+    /// Performance graphs: 0 = live, 1 = last hour, 2 = last 24 hours.
+    pub perf_range: usize,
 
     // network
     pub net_tab: usize,
@@ -146,6 +152,8 @@ pub struct App {
 
     // startup / services
     pub startup: Option<Vec<StartupItem>>,
+    /// Last boot timeline / startup impact (boot.json), reloaded every few seconds on the Startup page.
+    pub boot_rec: (Option<Instant>, Arc<crate::boot::BootRecord>),
     pub startup_loading: bool,
     pub services: Option<Vec<Service>>,
     pub services_loading: bool,
@@ -174,12 +182,15 @@ pub fn admin_needed(e: &str) -> bool {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, instance: Option<integration::Instance>, start_hidden: bool, start_ms: f64) -> Self {
-        install(&cc.egui_ctx);
         let cfg = Config::load();
+        crate::theme::set_palette(cfg.light_theme, cfg.accent);
+        install(&cc.egui_ctx);
+        crate::theme::apply_theme(&cc.egui_ctx, &cfg);
         let (history, log) = crate::sampler::load_history();
         let shared = Arc::new(Mutex::new(Shared {
             snap: Arc::new(Snapshot::default()),
             sys: Default::default(),
+            long: crate::sampler::load_long(),
             proc_hist: HashMap::new(),
             history,
             running_idx: HashMap::new(),
@@ -191,6 +202,7 @@ impl App {
             visible: (!start_hidden).into(),
             refresh_now: false.into(),
             want_conns: false.into(),
+            overlay: false.into(),
             repaint: Mutex::new(Some(cc.egui_ctx.clone())),
             info: Mutex::new(None),
         });
@@ -272,6 +284,9 @@ impl App {
             expanded_groups: HashSet::new(),
             tree_collapsed: HashSet::new(),
             sort_cache: Default::default(),
+            palette: crate::palette::Palette::test_open(),
+            overlay_styled: false,
+            pending_select: cfg.last_selected.clone(),
             only_hung: false,
             only_suspended: false,
             scroll_to_sel: false,
@@ -279,7 +294,8 @@ impl App {
             visible_rows: Vec::new(),
             perf_sel: std::env::var("SENTINEL_PERF").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| crate::config::test_mode()).map(|i| 100 + i).unwrap_or(0),
             per_core: false,
-            net_tab: 0,
+            perf_range: std::env::var("SENTINEL_RANGE").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| crate::config::test_mode()).unwrap_or(0),
+            net_tab: std::env::var("SENTINEL_NET").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| crate::config::test_mode()).unwrap_or(0),
             net_search: String::new(),
             net_hide_listen: false,
             net_only_active: false,
@@ -292,6 +308,7 @@ impl App {
             apps_sort: 0,
             apps_checked: HashSet::new(),
             startup: None,
+            boot_rec: (None, Arc::new(crate::boot::BootRecord::default())),
             startup_loading: false,
             services: None,
             services_loading: false,
@@ -351,6 +368,20 @@ impl App {
         let t = ctx.load_texture(spec, ci, egui::TextureOptions::LINEAR);
         self.textures.insert(spec.to_string(), t.clone());
         Some(t)
+    }
+
+    /// Draws a process icon: its own, a parent app's, or a letter badge (system processes get a glyph).
+    pub fn paint_proc_icon(&mut self, ui: &Ui, rect: egui::Rect, p: &Proc) {
+        let ctx = ui.ctx().clone();
+        let meta = self.info.meta(p.key(), p.path.as_ref());
+        let spec = meta.as_ref().and_then(|m| m.icon_key.clone());
+        let tex = spec.as_deref().and_then(|s| self.tex(&ctx, s));
+        if tex.is_some() || p.path.is_none() {
+            crate::theme::paint_icon(ui, rect, tex.as_ref(), if p.window.is_some() { crate::icons::APP_WINDOW } else { crate::icons::GEAR_SIX });
+        } else {
+            let name = meta.and_then(|m| m.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| p.name.clone());
+            crate::theme::paint_avatar(ui, rect, &name);
+        }
     }
 
     /// Runs an action that may need admin; on "access denied" offers a one-click elevated retry.
@@ -453,10 +484,19 @@ impl App {
 
     pub fn save_all(&mut self) {
         self.cfg.last_tab = PAGES.iter().position(|p| p.0 == self.page).unwrap_or(0);
+        if let Some(k) = self.selected {
+            if let Some(p) = self.snap.procs.iter().find(|p| p.key() == k) {
+                self.cfg.last_selected = Some(p.name.clone());
+            }
+        }
         self.cfg.save();
         let sh = self.shared.lock().unwrap();
         crate::sampler::save_history(&sh, self.cfg.history_days);
         self.last_save = Instant::now();
+    }
+
+    pub fn export_report(&mut self) {
+        crate::report::export(self);
     }
 
     pub fn set_on_top(&mut self, ctx: &egui::Context, on: bool) {
@@ -564,6 +604,12 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
+            self.palette.toggle();
+        }
+        if self.palette.open {
+            return;
+        }
         let typing = ctx.memory(|m| m.focused().is_some());
         let (esc, ctrl_f, f5, ctrl_w, ctrl_q, ctrl_n, f1, ctrl_p, num) = ctx.input(|i| {
             let num = (1..=9).find(|n| i.modifiers.command && i.key_pressed(match n {
@@ -647,13 +693,13 @@ impl App {
     fn sidebar(&mut self, ui: &mut Ui) {
         let collapsed = self.cfg.sidebar_collapsed;
         let w = ui.ctx().animate_value_with_time(egui::Id::unique("sbw"), if collapsed { 64.0 } else { 212.0 }, 0.16);
-        egui::Panel::left("sidebar").exact_size(w).resizable(false).show_separator_line(false).frame(egui::Frame::new().fill(SIDEBAR).inner_margin(egui::Margin { left: 10, right: 10, top: 14, bottom: 12 })).show(ui, |ui| {
+        egui::Panel::left("sidebar").exact_size(w).resizable(false).show_separator_line(false).frame(egui::Frame::new().fill(SIDEBAR()).inner_margin(egui::Margin { left: 10, right: 10, top: 14, bottom: 12 })).show(ui, |ui| {
             let full = w > 150.0;
             // Brand
             ui.horizontal(|ui| {
                 let (r, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
                 let painter = ui.painter();
-                painter.rect_filled(r, CornerRadius::same(10), ACCENT);
+                painter.rect_filled(r, CornerRadius::same(10), ACCENT());
                 painter.text(r.center(), egui::Align2::CENTER_CENTER, I::PULSE, egui::FontId::proportional(20.0), Color32::WHITE);
                 if resp.on_hover_text(if collapsed { "Expand sidebar" } else { "Collapse sidebar" }).clicked() {
                     self.cfg.sidebar_collapsed = !collapsed;
@@ -662,7 +708,7 @@ impl App {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.label(RichText::new("Sentinel").font(bold(16.0)));
-                        ui.label(RichText::new(format!("v{}", updater::VERSION)).size(11.0).color(FAINT));
+                        ui.label(RichText::new(format!("v{}", updater::VERSION)).size(11.0).color(FAINT()));
                     });
                 }
             });
@@ -680,11 +726,11 @@ impl App {
                 rects.push((i, rect));
                 let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 if i != sel_idx && hover > 0.0 {
-                    ui.painter().rect_filled(rect, CornerRadius::same(9), CARD_HI.gamma_multiply(hover * 0.8));
+                    ui.painter().rect_filled(rect, CornerRadius::same(9), CARD_HI().gamma_multiply(hover * 0.8));
                 }
                 let active = i == sel_idx;
-                let fg = if active { TEXT } else { lerp_color(MUTED, TEXT, hover) };
-                let ic = if active { ACCENT_HI } else { fg };
+                let fg = if active { TEXT() } else { lerp_color(MUTED(), TEXT(), hover) };
+                let ic = if active { ACCENT_HI() } else { fg };
                 let x = if full { rect.left() + 14.0 } else { rect.center().x };
                 let anchor = if full { egui::Align2::LEFT_CENTER } else { egui::Align2::CENTER_CENTER };
                 ui.painter().text(egui::pos2(x, rect.center().y), anchor, *icon, egui::FontId::proportional(17.0), ic);
@@ -696,7 +742,7 @@ impl App {
                         _ => None,
                     };
                     if let Some(b) = badge {
-                        ui.painter().text(egui::pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, b, egui::FontId::proportional(11.5), FAINT);
+                        ui.painter().text(egui::pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, b, egui::FontId::proportional(11.5), FAINT());
                     }
                 }
                 let resp = if full { resp } else { resp.on_hover_text(*label) };
@@ -708,8 +754,8 @@ impl App {
             if let Some((_, r)) = rects.iter().find(|(i, _)| *i == sel_idx) {
                 let y = ui.ctx().animate_value_with_time(egui::Id::unique("sbsel"), r.top(), 0.16);
                 let hl = egui::Rect::from_min_size(egui::pos2(r.left(), y), r.size());
-                ui.painter().rect_filled(hl, CornerRadius::same(9), ACCENT.gamma_multiply(0.14));
-                ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(hl.left(), hl.top() + 9.0), vec2(3.0, hl.height() - 18.0)), CornerRadius::same(2), ACCENT_HI);
+                ui.painter().rect_filled(hl, CornerRadius::same(9), ACCENT().gamma_multiply(0.14));
+                ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(hl.left(), hl.top() + 9.0), vec2(3.0, hl.height() - 18.0)), CornerRadius::same(2), ACCENT_HI());
             }
 
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -717,12 +763,12 @@ impl App {
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
                 let active = self.page == Page::Settings;
                 let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                ui.painter().rect_filled(rect, CornerRadius::same(9), if active { ACCENT.gamma_multiply(0.14) } else { CARD_HI.gamma_multiply(hover * 0.8) });
+                ui.painter().rect_filled(rect, CornerRadius::same(9), if active { ACCENT().gamma_multiply(0.14) } else { CARD_HI().gamma_multiply(hover * 0.8) });
                 let x = if full { rect.left() + 14.0 } else { rect.center().x };
                 let anchor = if full { egui::Align2::LEFT_CENTER } else { egui::Align2::CENTER_CENTER };
-                ui.painter().text(egui::pos2(x, rect.center().y), anchor, I::SLIDERS_HORIZONTAL, egui::FontId::proportional(17.0), if active { ACCENT_HI } else { MUTED });
+                ui.painter().text(egui::pos2(x, rect.center().y), anchor, I::SLIDERS_HORIZONTAL, egui::FontId::proportional(17.0), if active { ACCENT_HI() } else { MUTED() });
                 if full {
-                    ui.painter().text(egui::pos2(rect.left() + 42.0, rect.center().y), egui::Align2::LEFT_CENTER, "Settings", egui::FontId::proportional(13.5), if active { TEXT } else { MUTED });
+                    ui.painter().text(egui::pos2(rect.left() + 42.0, rect.center().y), egui::Align2::LEFT_CENTER, "Settings", egui::FontId::proportional(13.5), if active { TEXT() } else { MUTED() });
                 }
                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.page = Page::Settings;
@@ -732,12 +778,12 @@ impl App {
                 let on_top = self.cfg.always_on_top;
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
                 let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                ui.painter().rect_filled(rect, CornerRadius::same(9), if on_top { ACCENT.gamma_multiply(0.14) } else { CARD_HI.gamma_multiply(hover * 0.8) });
+                ui.painter().rect_filled(rect, CornerRadius::same(9), if on_top { ACCENT().gamma_multiply(0.14) } else { CARD_HI().gamma_multiply(hover * 0.8) });
                 let x = if full { rect.left() + 14.0 } else { rect.center().x };
                 let anchor = if full { egui::Align2::LEFT_CENTER } else { egui::Align2::CENTER_CENTER };
-                ui.painter().text(egui::pos2(x, rect.center().y), anchor, I::PUSH_PIN, egui::FontId::proportional(16.0), if on_top { ACCENT_HI } else { MUTED });
+                ui.painter().text(egui::pos2(x, rect.center().y), anchor, I::PUSH_PIN, egui::FontId::proportional(16.0), if on_top { ACCENT_HI() } else { MUTED() });
                 if full {
-                    ui.painter().text(egui::pos2(rect.left() + 42.0, rect.center().y), egui::Align2::LEFT_CENTER, "Always on top", egui::FontId::proportional(13.0), if on_top { TEXT } else { MUTED });
+                    ui.painter().text(egui::pos2(rect.left() + 42.0, rect.center().y), egui::Align2::LEFT_CENTER, "Always on top", egui::FontId::proportional(13.0), if on_top { TEXT() } else { MUTED() });
                 }
                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Keep Sentinel above other windows").clicked() {
                     self.set_on_top(ui.ctx(), !on_top);
@@ -747,16 +793,16 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.add_space(6.0);
                         if self.elevated {
-                            pill(ui, &format!("{}  Administrator", I::SHIELD_CHECK), GOOD);
+                            pill(ui, &format!("{}  Administrator", I::SHIELD_CHECK), GOOD());
                         } else {
-                            pill(ui, &format!("{}  Limited (UAC declined)", I::SHIELD_WARNING), WARN).on_hover_text("Restart Sentinel and accept the prompt for full control");
+                            pill(ui, &format!("{}  Limited (UAC declined)", I::SHIELD_WARNING), WARN()).on_hover_text("Restart Sentinel and accept the prompt for full control");
                         }
                     });
                 }
                 ui.add_space(10.0);
                 if full {
-                    meter(ui, "Memory", mem_pct / 100.0, &format!("{:.0}%", mem_pct), C_MEM);
-                    meter(ui, "CPU", sys_cpu / 100.0, &format!("{:.0}%", sys_cpu), C_CPU);
+                    meter(ui, "Memory", mem_pct / 100.0, &format!("{:.0}%", mem_pct), C_MEM());
+                    meter(ui, "CPU", sys_cpu / 100.0, &format!("{:.0}%", sys_cpu), C_CPU());
                 }
             });
         });
@@ -765,11 +811,11 @@ impl App {
     fn update_banner(&mut self, ui: &mut Ui) {
         let st = self.update.lock().unwrap().clone();
         if let updater::State::Ready { version, path, .. } = st {
-            egui::Frame::new().fill(ACCENT_DIM).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
+            egui::Frame::new().fill(ACCENT_DIM()).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(I::SPARKLE).color(ACCENT_HI).size(16.0));
+                    ui.label(RichText::new(I::SPARKLE).color(ACCENT_HI()).size(16.0));
                     ui.label(RichText::new(format!("Sentinel {version} is ready")).font(bold(13.0)));
-                    ui.label(RichText::new("It installs automatically next time the window is hidden.").color(MUTED).size(12.5));
+                    ui.label(RichText::new("It installs automatically next time the window is hidden.").color(MUTED()).size(12.5));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if button_sized(ui, Btn::Primary, I::ARROWS_CLOCKWISE, "Restart now", true, 28.0).clicked() {
                             self.apply_update(ui.ctx(), &path, true);
@@ -822,22 +868,22 @@ impl App {
             let resp = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(egui::pos2(screen.right() - 18.0, y + (1.0 - a) * 12.0)).pivot(egui::Align2::RIGHT_BOTTOM).show(ctx, |ui| {
                 ui.set_opacity(a);
                 let (icon, col) = match t.kind {
-                    ToastKind::Good => (I::CHECK_CIRCLE, GOOD),
-                    ToastKind::Bad => (I::WARNING_CIRCLE, BAD),
-                    ToastKind::Info => (I::INFO, ACCENT_HI),
+                    ToastKind::Good => (I::CHECK_CIRCLE, GOOD()),
+                    ToastKind::Bad => (I::WARNING_CIRCLE, BAD()),
+                    ToastKind::Info => (I::INFO, ACCENT_HI()),
                 };
-                egui::Frame::new().fill(CARD_HI).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 10)).shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(120) }).show(ui, |ui| {
+                egui::Frame::new().fill(CARD_HI()).stroke(Stroke::new(1.0, BORDER())).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 10)).shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(120) }).show(ui, |ui| {
                     ui.set_max_width(440.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icon).color(col).size(16.0));
-                        ui.add(egui::Label::new(RichText::new(&t.text).color(TEXT)).wrap());
+                        ui.add(egui::Label::new(RichText::new(&t.text).color(TEXT())).wrap());
                         if let Some(op) = &t.retry {
                             if button_sized(ui, Btn::Primary, I::SHIELD_CHECK, "Retry as admin", true, 26.0).clicked() {
                                 retry = Some(op.clone());
                                 close = Some(i);
                             }
                         }
-                        if ui.add(egui::Label::new(RichText::new(I::X).color(FAINT)).sense(Sense::click())).clicked() {
+                        if ui.add(egui::Label::new(RichText::new(I::X).color(FAINT())).sense(Sense::click())).clicked() {
                             close = Some(i);
                         }
                     });
@@ -876,10 +922,10 @@ fn meter(ui: &mut Ui, label: &str, frac: f32, value: &str, color: Color32) {
     });
     ui.horizontal(|ui| {
         ui.add_space(4.0);
-        ui.label(RichText::new(label).size(11.5).color(FAINT));
+        ui.label(RichText::new(label).size(11.5).color(FAINT()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(4.0);
-            ui.label(RichText::new(value).font(bold(11.5)).color(MUTED));
+            ui.label(RichText::new(value).font(bold(11.5)).color(MUTED()));
         });
     });
 }
@@ -887,6 +933,11 @@ fn meter(ui: &mut Ui, label: &str, frac: f32, value: &str, color: Color32) {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_msgs();
+        // Keep the mini overlay ticking while the main window is hidden.
+        if self.cfg.overlay && !self.visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+            ctx.request_repaint_after(Duration::from_millis(self.cfg.refresh_ms.max(500)));
+        }
         if self.show_flag.swap(false, Ordering::SeqCst) {
             self.on_show(ctx);
         }
@@ -931,8 +982,12 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.overlay(&ctx);
+        if !self.visible {
+            return; // painting only for the overlay
+        }
         self.sidebar(ui);
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin { left: 22, right: 22, top: 16, bottom: 10 })).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG()).inner_margin(egui::Margin { left: 22, right: 22, top: 16, bottom: 10 })).show(ui, |ui| {
             self.update_banner(ui);
             match self.page {
                 Page::Processes => self.processes_page(ui),
@@ -947,6 +1002,7 @@ impl eframe::App for App {
             }
         });
         self.modals(&ctx);
+        self.palette_ui(&ctx);
         self.toasts_ui(&ctx);
         if self.visible {
             let ms = if self.page == Page::Performance && self.cfg.smooth_graphs { 33 } else { self.cfg.refresh_ms.max(250) };
@@ -955,7 +1011,7 @@ impl eframe::App for App {
     }
 
     fn clear_color(&self, _v: &egui::Visuals) -> [f32; 4] {
-        [BG.r() as f32 / 255.0, BG.g() as f32 / 255.0, BG.b() as f32 / 255.0, 1.0]
+        [BG().r() as f32 / 255.0, BG().g() as f32 / 255.0, BG().b() as f32 / 255.0, 1.0]
     }
 }
 
@@ -966,7 +1022,7 @@ pub fn header(ui: &mut Ui, title: &str, subtitle: &str, right: impl FnOnce(&mut 
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(RichText::new(title).font(bold(22.0)));
             if !subtitle.is_empty() {
-                ui.label(RichText::new(subtitle).color(MUTED).size(12.5));
+                ui.label(RichText::new(subtitle).color(MUTED()).size(12.5));
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);

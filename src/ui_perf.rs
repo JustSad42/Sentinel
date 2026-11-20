@@ -60,10 +60,16 @@ impl App {
     pub fn performance_page(&mut self, ui: &mut Ui) {
         let snap = self.snap.clone();
         header(ui, "Performance", &format!("{}  ·  up {}", cpu_name(), fmt::duration(crate::win::uptime_secs())), |ui| {
-            let mut on = self.cfg.smooth_graphs;
-            if chip(ui, &mut on, "Smooth scrolling", None).clicked() {
-                self.cfg.smooth_graphs = on;
-                self.cfg.save();
+            let mut r = self.perf_range;
+            if segmented(ui, &mut r, &["Live", "1 hour", "24 hours"]) {
+                self.perf_range = r;
+            }
+            if self.perf_range == 0 {
+                let mut on = self.cfg.smooth_graphs;
+                if chip(ui, &mut on, "Smooth scrolling", None).clicked() {
+                    self.cfg.smooth_graphs = on;
+                    self.cfg.save();
+                }
             }
         });
         let mut list: Vec<Res> = vec![Res::Cpu, Res::Mem];
@@ -87,8 +93,10 @@ impl App {
                 _ => list.iter().position(|r| matches!(r, Res::Gpu)).unwrap_or(0),
             }
         };
-        let offset = self.smooth_offset();
+        let long_range = [0i64, 3600, 86400][self.perf_range.min(2)];
+        let offset = if long_range > 0 { 0.0 } else { self.smooth_offset() };
         let sh = self.shared.lock().unwrap();
+        let long_pts: Vec<crate::sampler::LongPoint> = if long_range > 0 { sh.long.iter().filter(|p| p.t >= crate::win::now_unix() - long_range).copied().collect() } else { Vec::new() };
         let sys = &sh.sys;
         // Copy what we need so the lock is short.
         let cpu = sys.cpu.clone();
@@ -109,47 +117,47 @@ impl App {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for (i, r) in list.iter().enumerate() {
                     let (icon, title, value, data, color, max): (&str, String, String, VecDeque<f32>, Color32, Option<f32>) = match r {
-                        Res::Cpu => (I::CPU, "CPU".into(), format!("{}  ·  {:.2} GHz", fmt::pct(snap.cpu_total), snap.extra.cpu_mhz.unwrap_or(cpu_mhz()) as f32 / 1000.0), cpu.clone(), C_CPU, Some(100.0)),
+                        Res::Cpu => (I::CPU, "CPU".into(), format!("{}  ·  {:.2} GHz", fmt::pct(snap.cpu_total), snap.extra.cpu_mhz.unwrap_or(cpu_mhz()) as f32 / 1000.0), cpu.clone(), C_CPU(), Some(100.0)),
                         Res::Mem => {
                             let used = snap.mem_total.saturating_sub(snap.mem_avail);
-                            (I::MEMORY, "Memory".into(), format!("{} / {} ({:.0}%)", fmt::bytes(used), fmt::bytes(snap.mem_total), used as f64 / snap.mem_total.max(1) as f64 * 100.0), mem.clone(), C_MEM, Some(100.0))
+                            (I::MEMORY, "Memory".into(), format!("{} / {} ({:.0}%)", fmt::bytes(used), fmt::bytes(snap.mem_total), used as f64 / snap.mem_total.max(1) as f64 * 100.0), mem.clone(), C_MEM(), Some(100.0))
                         }
                         Res::Disk(n) => {
                             let d = snap.disks.iter().find(|d| &d.name == n);
                             let kind = d.and_then(|d| d.info.as_ref()).map(|i| match i.ssd { Some(true) => "SSD", Some(false) => "HDD", None => "" }).unwrap_or("");
                             let temp = d.and_then(|d| d.temperature).map(|t| format!("  ·  {t}°C")).unwrap_or_default();
-                            (I::HARD_DRIVES, format!("Disk {n}  {kind}"), d.map(|d| format!("{:.0}%  ·  {}{temp}", d.active, fmt::rate(d.read + d.write))).unwrap_or_default(), disk_a.get(n).cloned().unwrap_or_default(), C_DISK, Some(100.0))
+                            (I::HARD_DRIVES, format!("Disk {n}  {kind}"), d.map(|d| format!("{:.0}%  ·  {}{temp}", d.active, fmt::rate(d.read + d.write))).unwrap_or_default(), disk_a.get(n).cloned().unwrap_or_default(), C_DISK(), Some(100.0))
                         }
                         Res::Net(n) => {
                             let a = snap.adapters.iter().find(|a| &a.alias == n);
                             let s = ad_s.get(n).cloned().unwrap_or_default();
                             let rr = ad_r.get(n).cloned().unwrap_or_default();
                             let sum: VecDeque<f32> = s.iter().zip(rr.iter()).map(|(a, b)| a + b).collect();
-                            (if a.is_some_and(|a| a.kind == "Wi-Fi") { I::WIFI_HIGH } else { I::GLOBE }, a.map(|a| a.kind.to_string()).unwrap_or_default() + " · " + n, a.map(|a| format!("↓ {}  ↑ {}", fmt::bits(a.recv_rate), fmt::bits(a.send_rate))).unwrap_or_default(), sum, C_NET, None)
+                            (if a.is_some_and(|a| a.kind == "Wi-Fi") { I::WIFI_HIGH } else { I::GLOBE }, a.map(|a| a.kind.to_string()).unwrap_or_default() + " · " + n, a.map(|a| format!("↓ {}  ↑ {}", fmt::bits(a.recv_rate), fmt::bits(a.send_rate))).unwrap_or_default(), sum, C_NET(), None)
                         }
                         Res::Gpu => {
                             let temp = snap.extra.gpu.temperature.map(|t| format!("  ·  {t:.0}°C")).unwrap_or_default();
-                            (I::GRAPHICS_CARD, "GPU".into(), format!("{}{temp}  ·  {}", fmt::pct(snap.gpu.util), gpu_info().0), gpu.clone(), C_GPU, Some(100.0))
+                            (I::GRAPHICS_CARD, "GPU".into(), format!("{}{temp}  ·  {}", fmt::pct(snap.gpu.util), gpu_info().0), gpu.clone(), C_GPU(), Some(100.0))
                         }
                         Res::System => {
                             let os = crate::hw::statics().map(|s| s.sys.os.clone()).unwrap_or_default();
-                            (I::MONITOR, "System".into(), format!("{os}  ·  up {}", fmt::duration(crate::win::uptime_secs())), VecDeque::new(), ACCENT_HI, None)
+                            (I::MONITOR, "System".into(), format!("{os}  ·  up {}", fmt::duration(crate::win::uptime_secs())), VecDeque::new(), ACCENT_HI(), None)
                         }
                     };
                     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 66.0), Sense::click());
                     let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                     let active = i == sel;
-                    ui.painter().rect(rect, CornerRadius::same(10), if active { CARD_HI } else { lerp_color(BG, CARD, hover) }, Stroke::new(1.0, if active { color.gamma_multiply(0.55) } else { Color32::TRANSPARENT }), egui::StrokeKind::Inside);
+                    ui.painter().rect(rect, CornerRadius::same(10), if active { CARD_HI() } else { lerp_color(BG(), CARD(), hover) }, Stroke::new(1.0, if active { color.gamma_multiply(0.55) } else { Color32::TRANSPARENT }), egui::StrokeKind::Inside);
                     let spark = egui::Rect::from_min_size(rect.left_top() + vec2(10.0, 12.0), vec2(64.0, 42.0));
-                    ui.painter().rect_filled(spark, CornerRadius::same(6), FIELD);
+                    ui.painter().rect_filled(spark, CornerRadius::same(6), FIELD());
                     if matches!(r, Res::System) {
-                        ui.painter().text(spark.center(), egui::Align2::CENTER_CENTER, I::INFO, egui::FontId::proportional(22.0), ACCENT_HI);
+                        ui.painter().text(spark.center(), egui::Align2::CENTER_CENTER, I::INFO, egui::FontId::proportional(22.0), ACCENT_HI());
                     } else {
                         graph::sparkline(ui, spark, &data, color, max, offset);
                     }
-                    ui.painter().text(rect.left_top() + vec2(86.0, 14.0), egui::Align2::LEFT_TOP, format!("{icon}  {title}"), bold(13.0), TEXT);
-                    let galley = ui.painter().layout(value, egui::FontId::proportional(11.5), MUTED, rect.width() - 96.0);
-                    ui.painter().galley(rect.left_top() + vec2(86.0, 34.0), galley, MUTED);
+                    ui.painter().text(rect.left_top() + vec2(86.0, 14.0), egui::Align2::LEFT_TOP, format!("{icon}  {title}"), bold(13.0), TEXT());
+                    let galley = ui.painter().layout(value, egui::FontId::proportional(11.5), MUTED(), rect.width() - 96.0);
+                    ui.painter().galley(rect.left_top() + vec2(86.0, 34.0), galley, MUTED());
                     if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         self.perf_sel = 100 + i;
                     }
@@ -158,14 +166,58 @@ impl App {
             });
         });
 
+        // Long ranges: HIST buckets of averages, so the same graphs can draw them.
+        let (cpu, mem, gpu, disk_a, disk_r, disk_w, ad_s, ad_r, gpu_temp, interval_long) = if long_range > 0 {
+            let n = crate::sampler::HIST;
+            let bw = long_range as f32 / n as f32;
+            let start = crate::win::now_unix() - long_range;
+            let series = |f: &dyn Fn(&crate::sampler::LongPoint) -> f32| -> VecDeque<f32> {
+                let mut sums = vec![(0.0f32, 0u32); n];
+                for p in &long_pts {
+                    let i = (((p.t - start) as f32) / bw) as usize;
+                    let v = f(p);
+                    if i < n && !v.is_nan() {
+                        sums[i].0 += v;
+                        sums[i].1 += 1;
+                    }
+                }
+                sums.iter().map(|(s, c)| if *c > 0 { s / *c as f32 } else { f32::NAN }).collect()
+            };
+            let all = |m: VecDeque<f32>| -> std::collections::HashMap<String, VecDeque<f32>> { list.iter().filter_map(|r| match r { Res::Disk(n) | Res::Net(n) => Some((n.clone(), m.clone())), _ => None }).collect() };
+            (
+                series(&|p| p.cpu),
+                series(&|p| p.mem),
+                series(&|p| p.gpu),
+                all(series(&|p| p.disk_active)),
+                all(series(&|p| p.disk_r)),
+                all(series(&|p| p.disk_w)),
+                all(series(&|p| p.up)),
+                all(series(&|p| p.down)),
+                series(&|p| p.gpu_temp),
+                bw,
+            )
+        } else {
+            (cpu, mem, gpu, disk_a, disk_r, disk_w, ad_s, ad_r, VecDeque::new(), 0.0)
+        };
+        let empty_q: VecDeque<f32> = VecDeque::new();
+        let long_note = if long_range > 0 {
+            let have = long_pts.first().map(|p| crate::win::now_unix() - p.t).unwrap_or(0);
+            Some(if have + 120 < long_range { format!("Averages · {} recorded so far (Sentinel records in the background)", fmt::duration(have.max(0) as u64)) } else { "Averages over the period".to_string() })
+        } else {
+            None
+        };
         egui::ScrollArea::vertical().id_salt("perf-detail").auto_shrink([false, false]).show(ui, |ui| {
             let w = ui.available_width();
-            let interval = snap.interval.max(0.25);
+            let interval = if long_range > 0 { interval_long } else { snap.interval.max(0.25) };
+            if let Some(n) = &long_note {
+                ui.label(RichText::new(format!("{}  {n}", I::CLOCK)).size(12.0).color(FAINT()));
+                ui.add_space(4.0);
+            }
             match &list[sel] {
                 Res::Cpu => {
-                    big_title(ui, "CPU", cpu_name(), &fmt::pct(snap.cpu_total), C_CPU);
+                    big_title(ui, "CPU", cpu_name(), &fmt::pct(snap.cpu_total), C_CPU());
                     let rect = alloc(ui, w, 240.0);
-                    graph::graph(ui, rect, &[Series { data: &cpu, color: C_CPU, label: "Total" }, Series { data: &cpu_k, color: BLUE.gamma_multiply(0.7), label: "Kernel" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
+                    graph::graph(ui, rect, &[Series { data: &cpu, color: C_CPU(), label: "Total" }, Series { data: if long_range > 0 { &empty_q } else { &cpu_k }, color: BLUE().gamma_multiply(0.7), label: "Kernel" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
                     ui.add_space(10.0);
                     let x = &snap.extra;
                     let st = crate::hw::statics().map(|s| s.cpu.clone()).unwrap_or_default();
@@ -218,11 +270,11 @@ impl App {
                                 ui.spacing_mut().item_spacing.x = 8.0;
                                 for &i in chunk {
                                     let r = alloc(ui, cw, 64.0);
-                                    ui.painter().rect_filled(r, CornerRadius::same(8), FIELD);
+                                    ui.painter().rect_filled(r, CornerRadius::same(8), FIELD());
                                     if let Some(d) = cores.get(i) {
-                                        graph::sparkline(ui, r.shrink(1.0), d, C_CPU, Some(100.0), offset);
+                                        graph::sparkline(ui, r.shrink(1.0), d, C_CPU(), Some(100.0), offset);
                                     }
-                                    ui.painter().text(r.left_top() + vec2(6.0, 4.0), egui::Align2::LEFT_TOP, format!("{i}  {}", fmt::pct(*snap.cores.get(i).unwrap_or(&0.0))), egui::FontId::proportional(10.5), MUTED);
+                                    ui.painter().text(r.left_top() + vec2(6.0, 4.0), egui::Align2::LEFT_TOP, format!("{i}  {}", fmt::pct(*snap.cores.get(i).unwrap_or(&0.0))), egui::FontId::proportional(10.5), MUTED());
                                 }
                             });
                             ui.add_space(4.0);
@@ -235,21 +287,21 @@ impl App {
                             ui.spacing_mut().item_spacing.x = 3.0;
                             for (i, v) in snap.cores.iter().enumerate() {
                                 let r = alloc(ui, bw, 46.0);
-                                ui.painter().rect_filled(r, CornerRadius::same(4), FIELD);
+                                ui.painter().rect_filled(r, CornerRadius::same(4), FIELD());
                                 let h = r.height() * (v / 100.0).clamp(0.0, 1.0);
-                                ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - h), r.right_bottom()), CornerRadius::same(4), lerp_color(C_CPU.gamma_multiply(0.6), BAD, (v / 100.0 - 0.6).max(0.0) * 2.5));
+                                ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - h), r.right_bottom()), CornerRadius::same(4), lerp_color(C_CPU().gamma_multiply(0.6), BAD(), (v / 100.0 - 0.6).max(0.0) * 2.5));
                                 ui.interact(r, ui.scope_id().with(("core", i)), Sense::hover()).on_hover_text(format!("CPU {i}: {}", fmt::pct(*v)));
                             }
                         });
                     }
                     ui.add_space(14.0);
-                    self.top_list(ui, "Top CPU", &snap.procs, |p| p.cpu as f64, |v| fmt::pct(v as f32), C_CPU, 100.0);
+                    self.top_list(ui, "Top CPU", &snap.procs, |p| p.cpu as f64, |v| fmt::pct(v as f32), C_CPU(), 100.0);
                 }
                 Res::Mem => {
                     let used = snap.mem_total.saturating_sub(snap.mem_avail);
-                    big_title(ui, "Memory", &format!("{} installed", fmt::bytes(snap.mem_total)), &fmt::bytes(used), C_MEM);
+                    big_title(ui, "Memory", &format!("{} installed", fmt::bytes(snap.mem_total)), &fmt::bytes(used), C_MEM());
                     let rect = alloc(ui, w, 220.0);
-                    graph::graph(ui, rect, &[Series { data: &mem, color: C_MEM, label: "In use" }, Series { data: &commit, color: PINK.gamma_multiply(0.6), label: "Committed" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
+                    graph::graph(ui, rect, &[Series { data: &mem, color: C_MEM(), label: "In use" }, Series { data: &commit, color: PINK().gamma_multiply(0.6), label: "Committed" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
                     ui.add_space(12.0);
                     label_caps(ui, "Composition");
                     let r = alloc(ui, w, 18.0);
@@ -258,9 +310,9 @@ impl App {
                     let segs: Vec<(f32, Color32, &str)> = if let Some(l) = &snap.extra.mem_lists {
                         let free = l.free + l.zero;
                         let in_use = snap.mem_total.saturating_sub(free + l.standby + l.modified);
-                        vec![(in_use as f32, C_MEM, "In use"), (l.modified as f32, ORANGE.gamma_multiply(0.75), "Modified"), (l.standby as f32, BLUE.gamma_multiply(0.6), "Standby"), (free as f32, BORDER, "Free")]
+                        vec![(in_use as f32, C_MEM(), "In use"), (l.modified as f32, ORANGE().gamma_multiply(0.75), "Modified"), (l.standby as f32, BLUE().gamma_multiply(0.6), "Standby"), (free as f32, BORDER(), "Free")]
                     } else {
-                        vec![(used as f32, C_MEM, "In use"), (cache as f32, BLUE.gamma_multiply(0.6), "Cached"), ((snap.mem_avail - cache) as f32, BORDER, "Free")]
+                        vec![(used as f32, C_MEM(), "In use"), (cache as f32, BLUE().gamma_multiply(0.6), "Cached"), ((snap.mem_avail - cache) as f32, BORDER(), "Free")]
                     };
                     let mut x = r.left();
                     for &(v, c, _) in &segs {
@@ -271,7 +323,7 @@ impl App {
                     ui.horizontal(|ui| {
                         for &(v, c, l) in &segs {
                             ui.label(RichText::new("●").color(c));
-                            ui.label(RichText::new(format!("{l} {}", fmt::bytes(v as u64))).size(12.0).color(MUTED));
+                            ui.label(RichText::new(format!("{l} {}", fmt::bytes(v as u64))).size(12.0).color(MUTED()));
                             ui.add_space(8.0);
                         }
                     });
@@ -320,13 +372,13 @@ impl App {
                             label_caps(ui, "Memory modules");
                             for d in &ms.dimms {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(I::MEMORY).color(C_MEM));
+                                    ui.label(RichText::new(I::MEMORY).color(C_MEM()));
                                     ui.label(RichText::new(fmt::bytes(d.size)).font(bold(13.0)));
                                     let spd = if d.configured > 0 && d.configured != d.speed { format!("{} MT/s (rated {})", d.configured, d.speed) } else { format!("{} MT/s", d.speed) };
-                                    ui.label(RichText::new(format!("{} {}  ·  {spd}", d.kind, d.form)).color(MUTED));
-                                    ui.label(RichText::new(format!("{} {}", d.maker, d.part)).color(FAINT));
+                                    ui.label(RichText::new(format!("{} {}  ·  {spd}", d.kind, d.form)).color(MUTED()));
+                                    ui.label(RichText::new(format!("{} {}", d.maker, d.part)).color(FAINT()));
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(RichText::new(&d.slot).size(11.5).color(FAINT));
+                                        ui.label(RichText::new(&d.slot).size(11.5).color(FAINT()));
                                     });
                                 });
                             }
@@ -334,20 +386,20 @@ impl App {
                     }
                     ui.add_space(14.0);
                     let tm = snap.mem_total as f64;
-                    self.top_list(ui, "Top memory", &snap.procs, |p| p.mem as f64, |v| fmt::bytes(v as u64), C_MEM, tm * 0.25);
+                    self.top_list(ui, "Top memory", &snap.procs, |p| p.mem as f64, |v| fmt::bytes(v as u64), C_MEM(), tm * 0.25);
                 }
                 Res::Disk(n) => {
                     let d = snap.disks.iter().find(|d| &d.name == n).cloned().unwrap_or_default();
                     let info = d.info.as_deref().cloned().unwrap_or_default();
                     let kind = match info.ssd { Some(true) => "SSD", Some(false) => "HDD", None => "Disk" };
                     let sub = [info.model.clone(), format!("{} {kind}", info.bus).trim().to_string(), if info.size > 0 { fmt::bytes(info.size) } else { String::new() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ·  ");
-                    big_title(ui, &format!("Disk {n}"), &sub, &format!("{:.0}% active", d.active), C_DISK);
+                    big_title(ui, &format!("Disk {n}"), &sub, &format!("{:.0}% active", d.active), C_DISK());
                     let empty = Ring::new();
                     let rect = alloc(ui, w, 170.0);
-                    graph::graph(ui, rect, &[Series { data: disk_a.get(n).unwrap_or(&empty), color: C_DISK, label: "Active time" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
+                    graph::graph(ui, rect, &[Series { data: disk_a.get(n).unwrap_or(&empty), color: C_DISK(), label: if long_range > 0 { "Busiest disk" } else { "Active time" } }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
                     ui.add_space(8.0);
                     let rect = alloc(ui, w, 150.0);
-                    graph::graph(ui, rect, &[Series { data: disk_r.get(n).unwrap_or(&empty), color: C_DISK, label: "Read" }, Series { data: disk_w.get(n).unwrap_or(&empty), color: CYAN, label: "Write" }], &Opts { max: None, fmt: &|v| fmt::rate(v as f64), offset, grid: true, rounded: true, interval });
+                    graph::graph(ui, rect, &[Series { data: disk_r.get(n).unwrap_or(&empty), color: C_DISK(), label: "Read" }, Series { data: disk_w.get(n).unwrap_or(&empty), color: CYAN(), label: "Write" }], &Opts { max: None, fmt: &|v| fmt::rate(v as f64), offset, grid: true, rounded: true, interval });
                     ui.add_space(10.0);
                     let mut items: Vec<(&str, String)> = vec![
                         ("Active time", format!("{:.0}%", d.active)),
@@ -381,10 +433,10 @@ impl App {
                                     ui.allocate_ui_with_layout(vec2(170.0, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                         ui.set_width(170.0);
                                         let l = if v.label.is_empty() { format!("Local disk  ·  {}", v.fs) } else { format!("{}  ·  {}", v.label, v.fs) };
-                                        ui.add(egui::Label::new(RichText::new(l).color(MUTED)).truncate());
+                                        ui.add(egui::Label::new(RichText::new(l).color(MUTED())).truncate());
                                     });
                                     let bw = (ui.available_width() - 200.0).max(60.0);
-                                    bar(ui, frac, if frac > 0.9 { BAD } else if frac > 0.8 { WARN } else { C_DISK }, bw, 8.0);
+                                    bar(ui, frac, if frac > 0.9 { BAD() } else if frac > 0.8 { WARN() } else { C_DISK() }, bw, 8.0);
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         ui.label(RichText::new(format!("{} free of {}", fmt::bytes(v.free), fmt::bytes(v.total))).size(12.5));
                                     });
@@ -393,14 +445,14 @@ impl App {
                         });
                     }
                     ui.add_space(14.0);
-                    self.top_list(ui, "Top I/O (all devices)", &snap.procs, |p| p.io_rate, fmt::rate, C_DISK, 50.0 * 1048576.0);
+                    self.top_list(ui, "Top I/O (all devices)", &snap.procs, |p| p.io_rate, fmt::rate, C_DISK(), 50.0 * 1048576.0);
                 }
                 Res::Net(n) => {
                     let a = snap.adapters.iter().find(|a| &a.alias == n).cloned().unwrap_or_default();
-                    big_title(ui, &a.alias, &a.description, &format!("↓ {}   ↑ {}", fmt::bits(a.recv_rate), fmt::bits(a.send_rate)), C_NET);
+                    big_title(ui, &a.alias, &a.description, &format!("↓ {}   ↑ {}", fmt::bits(a.recv_rate), fmt::bits(a.send_rate)), C_NET());
                     let empty = Ring::new();
                     let rect = alloc(ui, w, 220.0);
-                    graph::graph(ui, rect, &[Series { data: ad_r.get(n).unwrap_or(&empty), color: C_NET, label: "Receive" }, Series { data: ad_s.get(n).unwrap_or(&empty), color: CYAN, label: "Send" }], &Opts { max: None, fmt: &|v| fmt::bits(v as f64), offset, grid: true, rounded: true, interval });
+                    graph::graph(ui, rect, &[Series { data: ad_r.get(n).unwrap_or(&empty), color: C_NET(), label: "Receive" }, Series { data: ad_s.get(n).unwrap_or(&empty), color: CYAN(), label: "Send" }], &Opts { max: None, fmt: &|v| fmt::bits(v as f64), offset, grid: true, rounded: true, interval });
                     ui.add_space(10.0);
                     stats(ui, &[
                         ("Receive", fmt::bits(a.recv_rate)),
@@ -442,7 +494,7 @@ impl App {
                     let st = crate::hw::statics().cloned().unwrap_or_default();
                     let model = format!("{} {}", st.sys.maker, st.sys.model).trim().to_string();
                     let title = if model.is_empty() || model.eq_ignore_ascii_case(&st.sys.maker) { st.sys.board.clone() } else { model };
-                    big_title(ui, if title.is_empty() { "This PC" } else { &title }, &st.sys.os, &format!("up {}", fmt::duration(crate::win::uptime_secs())), ACCENT_HI);
+                    big_title(ui, if title.is_empty() { "This PC" } else { &title }, &st.sys.os, &format!("up {}", fmt::duration(crate::win::uptime_secs())), ACCENT_HI());
                     let boot = crate::win::now_unix() - crate::win::uptime_secs() as i64;
                     let mem_kind = [st.mem.kind(), if st.mem.speed() > 0 { format!("{} MT/s", st.mem.speed()) } else { String::new() }].join(" ");
                     let mut items: Vec<(&str, String)> = vec![
@@ -469,21 +521,25 @@ impl App {
                             ui.set_width(ui.available_width());
                             label_caps(ui, "Storage");
                             for d in disks {
-                                ui.label(RichText::new(format!("{}  {d}", I::HARD_DRIVES)).color(TEXT));
+                                ui.label(RichText::new(format!("{}  {d}", I::HARD_DRIVES)).color(TEXT()));
                             }
                         });
                     }
                 }
                 Res::Gpu => {
                     let (name, total) = gpu_info();
-                    big_title(ui, "GPU", name, &fmt::pct(snap.gpu.util), C_GPU);
+                    big_title(ui, "GPU", name, &fmt::pct(snap.gpu.util), C_GPU());
                     let rect = alloc(ui, w, 200.0);
-                    graph::graph(ui, rect, &[Series { data: &gpu, color: C_GPU, label: "Utilization" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
+                    graph::graph(ui, rect, &[Series { data: &gpu, color: C_GPU(), label: "Utilization" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
                     ui.add_space(8.0);
-                    if *total > 0 {
+                    if long_range > 0 && gpu_temp.iter().any(|v| *v > 0.0) {
+                        let rect = alloc(ui, w, 110.0);
+                        graph::graph(ui, rect, &[Series { data: &gpu_temp, color: ORANGE(), label: "Temperature" }], &Opts { max: None, fmt: &|v| format!("{v:.0} °C"), offset, grid: true, rounded: true, interval });
+                        ui.add_space(8.0);
+                    } else if *total > 0 && long_range == 0 {
                         let rect = alloc(ui, w, 110.0);
                         let t = *total as f32;
-                        graph::graph(ui, rect, &[Series { data: &gpu_mem, color: PINK, label: "Dedicated memory" }], &Opts { max: Some(t), fmt: &|v| fmt::bytes(v as u64), offset, grid: true, rounded: true, interval });
+                        graph::graph(ui, rect, &[Series { data: &gpu_mem, color: PINK(), label: "Dedicated memory" }], &Opts { max: Some(t), fmt: &|v| fmt::bytes(v as u64), offset, grid: true, rounded: true, interval });
                         ui.add_space(8.0);
                     }
                     let mut s: Vec<(String, String)> = vec![
@@ -516,7 +572,7 @@ impl App {
                     }
                     stats(ui, &s);
                     ui.add_space(14.0);
-                    self.top_list(ui, "Top GPU", &snap.procs, |p| p.gpu as f64, |v| fmt::pct(v as f32), C_GPU, 100.0);
+                    self.top_list(ui, "Top GPU", &snap.procs, |p| p.gpu as f64, |v| fmt::pct(v as f32), C_GPU(), 100.0);
                 }
             }
         });
@@ -528,15 +584,13 @@ impl App {
         if v.is_empty() {
             return;
         }
-        let ctx = ui.ctx().clone();
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             label_caps(ui, title);
             for p in v.into_iter().take(6) {
                 let r = ui.horizontal(|ui| {
-                    let tex = p.path.as_deref().and_then(|path| self.tex(&ctx, path));
                     let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                    paint_icon(ui, ir, tex.as_ref(), I::APP_WINDOW);
+                    self.paint_proc_icon(ui, ir, p);
                     let meta = self.info.meta(p.key(), p.path.as_ref());
                     let name = meta.and_then(|m| m.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| p.name.clone());
                     ui.allocate_ui_with_layout(vec2(240.0, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -571,7 +625,7 @@ fn big_title(ui: &mut Ui, title: &str, sub: &str, value: &str, color: Color32) {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(RichText::new(title).font(bold(20.0)));
-            ui.label(RichText::new(sub).color(MUTED).size(12.5));
+            ui.label(RichText::new(sub).color(MUTED()).size(12.5));
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(RichText::new(value).font(bold(24.0)).color(color));
@@ -594,11 +648,11 @@ fn stats_w<K: AsRef<str>>(ui: &mut Ui, items: &[(K, String)], min_w: f32) {
             ui.spacing_mut().item_spacing.x = 8.0;
             for (k, v) in chunk {
                 let (r, resp) = ui.allocate_exact_size(vec2(cw, 54.0), Sense::hover());
-                ui.painter().rect(r, CornerRadius::same(10), CARD, Stroke::new(1.0, BORDER_SOFT), egui::StrokeKind::Inside);
-                ui.painter().text(r.left_top() + vec2(12.0, 9.0), egui::Align2::LEFT_TOP, k.as_ref(), egui::FontId::proportional(11.5), FAINT);
-                let galley = ui.painter().layout_no_wrap(v.clone(), bold(14.0), TEXT);
+                ui.painter().rect(r, CornerRadius::same(10), CARD(), Stroke::new(1.0, BORDER_SOFT()), egui::StrokeKind::Inside);
+                ui.painter().text(r.left_top() + vec2(12.0, 9.0), egui::Align2::LEFT_TOP, k.as_ref(), egui::FontId::proportional(11.5), FAINT());
+                let galley = ui.painter().layout_no_wrap(v.clone(), bold(14.0), TEXT());
                 let clipped = galley.size().x > r.width() - 24.0;
-                ui.painter().with_clip_rect(r.shrink(8.0)).galley(r.left_top() + vec2(12.0, 27.0), galley, TEXT);
+                ui.painter().with_clip_rect(r.shrink(8.0)).galley(r.left_top() + vec2(12.0, 27.0), galley, TEXT());
                 if clipped {
                     resp.on_hover_text(v);
                 }

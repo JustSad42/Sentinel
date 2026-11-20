@@ -161,9 +161,38 @@ pub struct LogEvent {
     pub text: String,
 }
 
+/// One 10-second average for the 24-hour graphs.
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+pub struct LongPoint {
+    pub t: i64,
+    pub cpu: f32,
+    pub mem: f32,
+    /// NaN when no GPU sample was taken in this bucket.
+    pub gpu: f32,
+    pub gpu_temp: f32,
+    pub disk_r: f32,
+    pub disk_w: f32,
+    pub disk_active: f32,
+    pub down: f32,
+    pub up: f32,
+}
+
+pub const LONG_SECS: i64 = 10;
+pub const LONG_KEEP: usize = 8640 + 360;
+
+#[derive(Default)]
+struct LongAcc {
+    n: u32,
+    gpu_n: u32,
+    temp_n: u32,
+    sum: LongPoint,
+    started: i64,
+}
+
 pub struct Shared {
     pub snap: Arc<Snapshot>,
     pub sys: SysHistory,
+    pub long: VecDeque<LongPoint>,
     pub proc_hist: HashMap<Key, VecDeque<ProcPoint>>,
     pub history: Vec<HistEntry>,
     pub running_idx: HashMap<Key, usize>,
@@ -189,6 +218,8 @@ pub struct Control {
     /// Set by the UI: the sampler warms names and icons for new processes even while hidden,
     /// so opening the window shows a finished list instead of rows filling in.
     pub info: Mutex<Option<Arc<crate::info::Info>>>,
+    /// The mini overlay is showing (needs GPU numbers even while the window is hidden).
+    pub overlay: AtomicBool,
 }
 
 // ---------------------------------------------------------------- NT structures
@@ -342,6 +373,8 @@ pub struct Sampler {
     prev_at: Option<Instant>,
     prev_adapters: HashMap<u32, (u64, u64, u64, u64)>,
     hw: crate::hw::Dyn,
+    long_acc: LongAcc,
+    boot: crate::boot::Tracker,
     pdh: Option<Pdh>,
     disk_io: Option<crate::disk::Disks>,
     paths: HashMap<Key, Option<Arc<str>>>,
@@ -374,6 +407,8 @@ impl Sampler {
             prev_at: None,
             prev_adapters: HashMap::new(),
             hw: Default::default(),
+            long_acc: LongAcc::default(),
+            boot: Default::default(),
             pdh: None,
             disk_io: None,
             paths: HashMap::new(),
@@ -558,7 +593,9 @@ impl Sampler {
 
         // --- GPU & disks (counters are comparatively expensive: only while visible)
         let (mut gpu, mut disks) = (GpuSample::default(), Vec::new());
-        if visible {
+        let overlay = self.ctl.overlay.load(Ordering::Relaxed);
+        let long_tick = self.tick % 10 == 0;
+        if visible || overlay || long_tick {
             if let Some(pdh) = self.pdh.as_mut() {
                 if pdh.collect() {
                     gpu = pdh.gpu();
@@ -668,15 +705,37 @@ impl Sampler {
         self.apply_rules(&procs, elapsed as f32);
 
         // --- deeper kernel / hardware counters
-        let extra = self.hw.sample(elapsed, visible, self.tick, (tot_intr, tot_dpc, tot_irq, tot_all));
+        let extra = self.hw.sample(elapsed, visible || overlay || long_tick, self.tick, (tot_intr, tot_dpc, tot_irq, tot_all));
+
+        // --- boot timeline / startup impact (first minutes of the session only)
+        self.boot.sample(&procs, cpu_total);
 
         // --- warm metadata + icons
         let info = self.ctl.info.lock().unwrap().clone();
         if let Some(info) = info {
+            let by_pid: HashMap<u32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
             for p in &procs {
-                let _ = info.meta(p.key(), p.path.as_ref());
-                if let Some(path) = &p.path {
-                    let _ = info.icon(path);
+                info.warm(p.key(), p.path.as_ref(), || {
+                    let mut out = Vec::new();
+                    let mut cur = p;
+                    for _ in 0..6 {
+                        match by_pid.get(&cur.ppid) {
+                            // Parent must be older than the child, or the PID was reused.
+                            Some(par) if par.pid != cur.pid && par.create_time <= cur.create_time => {
+                                if let Some(path) = &par.path {
+                                    out.push(path.clone());
+                                }
+                                cur = par;
+                            }
+                            _ => break,
+                        }
+                    }
+                    out
+                });
+                if let Some(m) = info.meta(p.key(), p.path.as_ref()) {
+                    if let Some(k) = &m.icon_key {
+                        let _ = info.icon(k);
+                    }
                 }
             }
             if self.tick % 300 == 7 {
@@ -734,6 +793,51 @@ impl Sampler {
             h.push_back(ProcPoint { cpu: p.cpu, mem: p.mem, io: p.io_rate, net: p.net_rate() });
         }
         sh.proc_hist.retain(|k, _| seen.contains(k));
+        // 24-hour history: 10-second averages
+        {
+            let now_u = now_unix;
+            let a = &mut self.long_acc;
+            if a.n == 0 {
+                a.started = now_u;
+            }
+            let used = mem_total.saturating_sub(mem_avail);
+            a.n += 1;
+            a.sum.cpu += cpu_total;
+            a.sum.mem += if mem_total > 0 { used as f32 / mem_total as f32 * 100.0 } else { 0.0 };
+            if visible || overlay || long_tick {
+                a.gpu_n += 1;
+                a.sum.gpu += gpu.util;
+            }
+            if let Some(t) = extra.gpu.temperature {
+                a.temp_n += 1;
+                a.sum.gpu_temp += t;
+            }
+            a.sum.disk_r += disks.iter().map(|d| d.read as f32).sum::<f32>();
+            a.sum.disk_w += disks.iter().map(|d| d.write as f32).sum::<f32>();
+            a.sum.disk_active += disks.iter().map(|d| d.active).fold(0.0, f32::max);
+            a.sum.down += net_recv as f32;
+            a.sum.up += net_send as f32;
+            if now_u - a.started >= LONG_SECS {
+                let n = a.n as f32;
+                let p = LongPoint {
+                    t: now_u,
+                    cpu: a.sum.cpu / n,
+                    mem: a.sum.mem / n,
+                    gpu: if a.gpu_n > 0 { a.sum.gpu / a.gpu_n as f32 } else { f32::NAN },
+                    gpu_temp: if a.temp_n > 0 { a.sum.gpu_temp / a.temp_n as f32 } else { f32::NAN },
+                    disk_r: a.sum.disk_r / n,
+                    disk_w: a.sum.disk_w / n,
+                    disk_active: a.sum.disk_active / n,
+                    down: a.sum.down / n,
+                    up: a.sum.up / n,
+                };
+                if sh.long.len() >= LONG_KEEP {
+                    sh.long.pop_front();
+                }
+                sh.long.push_back(p);
+                *a = LongAcc::default();
+            }
+        }
         // system history
         {
             let s = &mut sh.sys;
@@ -896,7 +1000,20 @@ pub fn load_history() -> (Vec<HistEntry>, VecDeque<LogEvent>) {
     (h, log)
 }
 
+pub fn load_long() -> VecDeque<LongPoint> {
+    let cutoff = win::now_unix() - 86400 - 3600;
+    let v: Vec<LongPoint> = std::fs::read(crate::config::data_dir().join("long-history.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    v.into_iter().filter(|p| p.t >= cutoff).map(|p| LongPoint { gpu: if p.gpu < 0.0 { f32::NAN } else { p.gpu }, gpu_temp: if p.gpu_temp < 0.0 { f32::NAN } else { p.gpu_temp }, ..p }).collect()
+}
+
 pub fn save_history(sh: &Shared, keep_days: u32) {
+    {
+        // NaN isn't valid JSON: store missing GPU samples as -1.
+        let v: Vec<LongPoint> = sh.long.iter().map(|p| LongPoint { gpu: if p.gpu.is_nan() { -1.0 } else { p.gpu }, gpu_temp: if p.gpu_temp.is_nan() { -1.0 } else { p.gpu_temp }, ..*p }).collect();
+        if let Ok(b) = serde_json::to_vec(&v) {
+            let _ = std::fs::write(crate::config::data_dir().join("long-history.json"), b);
+        }
+    }
     let cutoff = win::now_unix() - keep_days.max(1) as i64 * 86400;
     let mut list: Vec<&HistEntry> = sh.history.iter().filter(|e| e.ended.unwrap_or(i64::MAX) >= cutoff).collect();
     if list.len() > 30_000 {

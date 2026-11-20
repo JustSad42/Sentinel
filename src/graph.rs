@@ -76,50 +76,62 @@ pub fn graph(ui: &mut Ui, rect: Rect, series: &[Series], o: &Opts) -> egui::Resp
     let painter = ui.painter_at(rect);
     let max = o.max.unwrap_or_else(|| nice_max(series.iter().flat_map(|s| s.data.iter().copied()).fold(0.0f32, f32::max) * 1.1));
     if o.rounded {
-        painter.rect_filled(rect, CornerRadius::same(8), FIELD);
+        painter.rect_filled(rect, CornerRadius::same(8), FIELD());
     }
     if o.grid {
         for i in 1..4 {
             let y = rect.top() + rect.height() * i as f32 / 4.0;
-            painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0, BORDER_SOFT));
+            painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0, BORDER_SOFT()));
         }
         let step = rect.width() / (HIST as f32 - 2.0);
         let cols = 6;
         for i in 1..cols {
             // Vertical lines scroll with the data.
             let x = rect.right() - (i as f32 * (HIST as f32 / cols as f32) + o.offset) * step;
-            painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, BORDER_SOFT.gamma_multiply(0.6)));
+            painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, BORDER_SOFT().gamma_multiply(0.6)));
         }
     }
     for s in series {
         if s.data.len() < 2 {
             continue;
         }
+        // NaN samples are gaps (time nothing was recorded): draw each run separately.
         let pts = points(rect, s.data, max, o.offset);
-        painter.add(Shape::mesh(fill_mesh(rect, &pts, s.color)));
-        painter.add(Shape::line(pts, Stroke::new(1.6, s.color)));
+        for run in pts.split(|p| p.y.is_nan()).filter(|r| r.len() >= 2) {
+            painter.add(Shape::mesh(fill_mesh(rect, run, s.color)));
+            painter.add(Shape::line(run.to_vec(), Stroke::new(1.6, s.color)));
+        }
     }
     // Axis max label.
-    painter.text(rect.left_top() + vec2(6.0, 4.0), egui::Align2::LEFT_TOP, (o.fmt)(max), egui::FontId::proportional(10.5), FAINT);
+    painter.text(rect.left_top() + vec2(6.0, 4.0), egui::Align2::LEFT_TOP, (o.fmt)(max), egui::FontId::proportional(10.5), FAINT());
     if let Some(p) = resp.hover_pos() {
         let step = rect.width() / (HIST as f32 - 2.0);
         let back = (((rect.right() - p.x) / step) - o.offset).round().max(0.0) as usize;
         let x = rect.right() - (back as f32 + o.offset) * step;
-        painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, MUTED.gamma_multiply(0.5)));
+        painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, MUTED().gamma_multiply(0.5)));
         let mut lines = Vec::new();
         for s in series {
-            if back < s.data.len() {
+            if back < s.data.len() && !s.data[s.data.len() - 1 - back].is_nan() {
                 let v = s.data[s.data.len() - 1 - back];
                 let y = rect.bottom() - (v / max).clamp(0.0, 1.0) * (rect.height() - 2.0) - 1.0;
                 painter.circle_filled(pos2(x, y), 3.5, s.color);
-                painter.circle_stroke(pos2(x, y), 3.5, Stroke::new(1.5, BG));
+                painter.circle_stroke(pos2(x, y), 3.5, Stroke::new(1.5, BG()));
                 lines.push((s.color, if s.label.is_empty() { (o.fmt)(v) } else { format!("{}  {}", s.label, (o.fmt)(v)) }));
             }
         }
         if !lines.is_empty() {
             let secs = (back as f32 * o.interval).round() as u64;
             egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), resp.id.with("tip"), egui::PopupAnchor::Pointer).gap(12.0).show(|ui| {
-                ui.label(egui::RichText::new(if secs == 0 { "now".to_string() } else { format!("{secs}s ago") }).size(11.0).color(FAINT));
+                let ago = if secs == 0 {
+                    "now".to_string()
+                } else if secs < 120 {
+                    format!("{secs}s ago")
+                } else if secs < 7200 {
+                    format!("{} min ago", secs / 60)
+                } else {
+                    format!("{}h {:02}m ago", secs / 3600, (secs % 3600) / 60)
+                };
+                ui.label(egui::RichText::new(ago).size(11.0).color(FAINT()));
                 for (c, t) in lines {
                     ui.label(egui::RichText::new(t).color(c).font(bold(12.5)));
                 }

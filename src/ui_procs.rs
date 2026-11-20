@@ -141,11 +141,11 @@ fn col_width(c: Col) -> f32 {
         Col::Pid => 64.0,
         Col::Status => 104.0,
         Col::User => 100.0,
-        Col::Cpu => 66.0,
-        Col::Memory => 88.0,
-        Col::Disk => 86.0,
-        Col::Network => 90.0,
-        Col::Gpu => 60.0,
+        Col::Cpu => 86.0,
+        Col::Memory => 104.0,
+        Col::Disk => 104.0,
+        Col::Network => 108.0,
+        Col::Gpu => 84.0,
         Col::GpuMem => 90.0,
         Col::Threads | Col::Handles => 70.0,
         Col::Priority => 100.0,
@@ -463,9 +463,16 @@ impl App {
             if icon_button(ui, I::TERMINAL_WINDOW, "Run new task (Ctrl+N)", false).clicked() {
                 self.modal = Some(Modal::RunTask { cmd: String::new(), admin: false });
             }
-            ui.menu_button(RichText::new(format!("{}  Columns", I::SQUARES_FOUR)).color(MUTED), |ui| {
-                ui.set_min_width(180.0);
-                for c in Col::ALL {
+            ui.menu_button(RichText::new(format!("{}  Columns", I::SQUARES_FOUR)).color(MUTED()), |ui| {
+                ui.set_min_width(200.0);
+                for (i, c) in Col::ALL.into_iter().enumerate() {
+                    if i == 0 {
+                        label_caps(ui, "Usage");
+                    }
+                    if c == Col::Pid {
+                        ui.separator();
+                        label_caps(ui, "Extra");
+                    }
                     let mut on = self.cfg.columns.contains(&c);
                     if ui.checkbox(&mut on, c.label()).changed() {
                         if on {
@@ -510,11 +517,11 @@ impl App {
                 chip(ui, &mut self.only_suspended, &format!("{} Suspended", I::SNOWFLAKE), Some(susp));
             }
             if !self.search.is_empty() {
-                ui.label(RichText::new("Showing matches as a list").size(12.0).color(FAINT));
+                ui.label(RichText::new("Showing matches as a list").size(12.0).color(FAINT()));
             }
         });
         // Type anywhere to search.
-        if !ctx.memory(|m| m.focused().is_some()) && self.modal.is_none() {
+        if !ctx.memory(|m| m.focused().is_some()) && self.modal.is_none() && !self.palette.open {
             let typed: String = ctx.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.clone()) } else { None }).collect());
             if !typed.is_empty() && !ctx.input(|i| i.modifiers.command) && typed.chars().all(|c| !c.is_control()) {
                 self.search.push_str(&typed);
@@ -523,6 +530,15 @@ impl App {
         }
         ui.add_space(8.0);
 
+        // Restore the selection from the last session once that app is running.
+        if self.selected.is_none() && !snap.procs.is_empty() {
+            if let Some(want) = self.pending_select.take() {
+                if let Some(p) = snap.procs.iter().filter(|p| p.name.eq_ignore_ascii_case(&want)).max_by_key(|p| p.mem) {
+                    self.selected = Some(p.key());
+                    self.scroll_to_sel = true;
+                }
+            }
+        }
         // Test hook for screenshots: SENTINEL_SELECT=<exe name>
         if self.selected.is_none() && crate::config::test_mode() {
             if let Ok(want) = std::env::var("SENTINEL_SELECT") {
@@ -588,7 +604,7 @@ impl App {
         let mut table_ui = ui.new_child(egui::UiBuilder::new().max_rect(table_rect).layout(Layout::top_down(Align::Min)));
         table_ui.set_clip_rect(table_rect.intersect(ui.clip_rect()));
         let ui = &mut table_ui;
-        egui::Frame::new().fill(CARD).stroke(Stroke::new(1.0, BORDER_SOFT)).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin { left: 6, right: 6, top: 4, bottom: 4 }).show(ui, |ui| {
+        egui::Frame::new().fill(CARD()).stroke(Stroke::new(1.0, BORDER_SOFT())).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin { left: 6, right: 6, top: 4, bottom: 4 }).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             ui.style_mut().spacing.item_spacing.x = 10.0;
             let mut tb = TableBuilder::new(ui)
@@ -608,23 +624,26 @@ impl App {
             let sort_col = self.cfg.sort_col;
             let sort_desc = self.cfg.sort_desc;
             let sums = (snap.cpu_total, snap.mem_total - snap.mem_avail, snap.procs.iter().map(|p| p.io_rate).sum::<f64>(), snap.net_send + snap.net_recv, snap.gpu.util);
-            tb.header(30.0, |mut h| {
+            tb.header(46.0, |mut h| {
                 h.col(|ui| {
-                    if header_cell(ui, "Name", None, sort_col.is_none(), sort_desc, false) {
+                    if header_cell(ui, "Name", None, TEXT(), sort_col.is_none(), sort_desc, false) {
                         acts.push(Act::SortName);
                     }
                 });
                 for c in &cols {
                     h.col(|ui| {
-                        let top = match c {
-                            Col::Cpu => Some(fmt::pct(sums.0)),
-                            Col::Memory => Some(format!("{:.0}%", sums.1 as f64 / total_mem * 100.0)),
-                            Col::Disk => Some(fmt::rate(sums.2)),
-                            Col::Network if snap.per_app_net => Some(fmt::rate(sums.3)),
-                            Col::Gpu => Some(fmt::pct(sums.4)),
-                            _ => None,
+                        // System totals above each usage column, in the column's colour (amber/red when high).
+                        let sev = |v: f32, warn: f32, bad: f32, base: Color32| if v >= bad { BAD() } else if v >= warn { WARN() } else { base };
+                        let mem_pct = (sums.1 as f64 / total_mem * 100.0) as f32;
+                        let (top, color) = match c {
+                            Col::Cpu => (Some(fmt::pct(sums.0)), sev(sums.0, 70.0, 90.0, C_CPU())),
+                            Col::Memory => (Some(format!("{mem_pct:.0}%")), sev(mem_pct, 80.0, 90.0, C_MEM())),
+                            Col::Disk => (Some(fmt::rate(sums.2)), C_DISK()),
+                            Col::Network if snap.per_app_net => (Some(fmt::rate(sums.3)), C_NET()),
+                            Col::Gpu => (Some(fmt::pct(sums.4)), sev(sums.4, 80.0, 95.0, C_GPU())),
+                            _ => (None, TEXT()),
                         };
-                        if header_cell(ui, c.label(), top.as_deref(), sort_col == Some(*c), sort_desc, c.numeric()) {
+                        if header_cell(ui, c.label(), top.as_deref(), color, sort_col == Some(*c), sort_desc, c.numeric()) {
                             acts.push(Act::Sort(*c));
                         }
                     });
@@ -633,14 +652,15 @@ impl App {
             .body(|body| {
                 let tree = self.cfg.view == ViewMode::Tree;
                 let flat = rows.iter().all(|r| matches!(r, Row::Proc { depth: 0, expander: None, .. }));
-                body.rows(30.0, rows.len(), |mut row| {
+                let row_h = if self.cfg.compact_rows { 24.0 } else { 30.0 };
+                body.rows(row_h, rows.len(), |mut row| {
                     let ri = row.index();
                     match &rows[ri] {
                         Row::Section { s, count, collapsed } => {
                             row.col(|ui| {
-                                caret_slot(ui, 0.0, Some(!*collapsed), FAINT);
-                                ui.label(RichText::new(s.label().to_uppercase()).font(bold(11.0)).color(MUTED).extra_letter_spacing(0.8));
-                                ui.label(RichText::new(count.to_string()).size(11.0).color(FAINT));
+                                caret_slot(ui, 0.0, Some(!*collapsed), FAINT());
+                                ui.label(RichText::new(s.label().to_uppercase()).font(bold(11.0)).color(MUTED()).extra_letter_spacing(0.8));
+                                ui.label(RichText::new(count.to_string()).size(11.0).color(FAINT()));
                             });
                             for _ in &cols {
                                 row.col(|_| {});
@@ -654,11 +674,11 @@ impl App {
                             row.set_selected(self.sel_group.as_deref() == Some(key.as_str()));
                             let mut caret_hit = 0.0;
                             row.col(|ui| {
-                                caret_hit = caret_slot(ui, 0.0, Some(*expanded), MUTED);
+                                caret_hit = caret_slot(ui, 0.0, Some(*expanded), MUTED());
                                 self.name_cell(ui, first, true);
-                                ui.label(RichText::new(format!("({})", members.len())).color(FAINT));
+                                ui.label(RichText::new(format!("({})", members.len())).color(FAINT()));
                                 if agg.hung {
-                                    pill(ui, "Not responding", BAD);
+                                    pill(ui, "Not responding", BAD());
                                 }
                             });
                             for c in &cols {
@@ -708,7 +728,7 @@ impl App {
                                 // Every row keeps the same arrow slot so names line up; children shift only slightly.
                                 if !flat {
                                     let indent = if tree { *depth as f32 * 10.0 } else { depth.saturating_sub(1) as f32 * 12.0 };
-                                    caret_hit = caret_slot(ui, indent, *expander, MUTED);
+                                    caret_hit = caret_slot(ui, indent, *expander, MUTED());
                                 }
                                 self.name_cell(ui, p, false);
                             });
@@ -741,7 +761,7 @@ impl App {
     }
 
     fn keyboard_nav(&mut self, ctx: &egui::Context, snap: &Snapshot, search_id: egui::Id) {
-        if self.modal.is_some() {
+        if self.modal.is_some() || self.palette.open {
             return;
         }
         let search_focused = ctx.memory(|m| m.has_focus(search_id));
@@ -816,24 +836,30 @@ impl App {
     }
 
     fn name_cell(&mut self, ui: &mut Ui, p: &Proc, group: bool) {
-        let ctx = ui.ctx().clone();
-        let tex = p.path.as_deref().and_then(|path| self.tex(&ctx, path));
         let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-        paint_icon(ui, r, tex.as_ref(), if p.window.is_some() { I::APP_WINDOW } else { I::GEAR_SIX });
+        self.paint_proc_icon(ui, r, p);
         let (name, exe) = self.display_name(p);
         let pinned = self.cfg.pinned.iter().any(|n| n.eq_ignore_ascii_case(&p.name));
         if pinned {
-            ui.label(RichText::new(I::PUSH_PIN).size(11.0).color(ACCENT_HI));
+            ui.label(RichText::new(I::PUSH_PIN).size(11.0).color(ACCENT_HI()));
         }
-        ui.add(egui::Label::new(RichText::new(&name).color(TEXT)).truncate().selectable(false));
+        let hung = p.window.as_ref().is_some_and(|w| w.hung);
+        ui.add(egui::Label::new(RichText::new(&name).color(TEXT())).truncate().selectable(false)).on_hover_text(format!("{}  ·  PID {}", p.name, p.pid));
+        if !group && !self.cfg.columns.contains(&Col::Status) {
+            if hung {
+                pill(ui, "Not responding", BAD());
+            } else if p.suspended {
+                pill(ui, "Suspended", BLUE());
+            }
+        }
         if !group {
             if let Some(e) = exe {
-                ui.add(egui::Label::new(RichText::new(e).size(11.5).color(FAINT)).truncate().selectable(false));
+                ui.add(egui::Label::new(RichText::new(e).size(11.5).color(FAINT())).truncate().selectable(false));
             }
             if let Some(svcs) = self.snap.services_by_pid.get(&p.pid) {
                 if p.name.eq_ignore_ascii_case("svchost.exe") {
                     let t = if svcs.len() == 1 { svcs[0].1.clone() } else { format!("{} services", svcs.len()) };
-                    ui.add(egui::Label::new(RichText::new(t).size(11.5).color(FAINT)).truncate().selectable(false));
+                    ui.add(egui::Label::new(RichText::new(t).size(11.5).color(FAINT())).truncate().selectable(false));
                 }
             }
         }
@@ -851,9 +877,9 @@ impl App {
             Col::Conns => num_cell(ui, &a.conns.to_string(), Color32::TRANSPARENT),
             Col::Status => {
                 if a.hung {
-                    pill(ui, "Not responding", BAD);
+                    pill(ui, "Not responding", BAD());
                 } else if a.suspended {
-                    pill(ui, "Suspended", BLUE);
+                    pill(ui, "Suspended", BLUE());
                 }
             }
             _ => {}
@@ -873,29 +899,29 @@ impl App {
             Col::Conns => num_cell(ui, &if p.conns > 0 { p.conns.to_string() } else { String::new() }, Color32::TRANSPARENT),
             Col::Status => {
                 if p.window.as_ref().is_some_and(|w| w.hung) {
-                    pill(ui, "Not responding", BAD);
+                    pill(ui, "Not responding", BAD());
                 } else if p.suspended {
-                    pill(ui, "Suspended", BLUE);
+                    pill(ui, "Suspended", BLUE());
                 } else if self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.elevated).unwrap_or(false) {
-                    ui.label(RichText::new(format!("{} Admin", I::SHIELD_CHECK)).size(11.5).color(FAINT));
+                    ui.label(RichText::new(format!("{} Admin", I::SHIELD_CHECK)).size(11.5).color(FAINT()));
                 }
             }
             Col::User => {
                 let u = self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.user.clone()).unwrap_or_default();
-                ui.add(egui::Label::new(RichText::new(u).color(MUTED)).truncate());
+                ui.add(egui::Label::new(RichText::new(u).color(MUTED())).truncate());
             }
             Col::Priority => {
-                ui.label(RichText::new(Priority::from_base(p.base_priority).label()).color(MUTED));
+                ui.label(RichText::new(Priority::from_base(p.base_priority).label()).color(MUTED()));
             }
             Col::Started => {
-                ui.label(RichText::new(fmt::when(win::filetime_to_unix(p.create_time))).color(MUTED));
+                ui.label(RichText::new(fmt::when(win::filetime_to_unix(p.create_time))).color(MUTED()));
             }
             Col::Path => {
-                ui.add(egui::Label::new(RichText::new(p.path.as_deref().unwrap_or("")).color(MUTED)).truncate());
+                ui.add(egui::Label::new(RichText::new(p.path.as_deref().unwrap_or("")).color(MUTED())).truncate());
             }
             Col::CommandLine => {
                 let c = self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.cmdline.clone()).unwrap_or_default();
-                ui.add(egui::Label::new(RichText::new(c).color(MUTED).monospace().size(11.5)).truncate());
+                ui.add(egui::Label::new(RichText::new(c).color(MUTED()).monospace().size(11.5)).truncate());
             }
         }
     }
@@ -909,7 +935,7 @@ impl App {
                 ui.close();
             }
         }
-        if ui.button(RichText::new(format!("{}  End task", I::X_CIRCLE)).color(BAD)).clicked() {
+        if ui.button(RichText::new(format!("{}  End task", I::X_CIRCLE)).color(BAD())).clicked() {
             acts.push(Act::Kill(vec![p.key()], vec![name.clone()], format!("End {name}?")));
             ui.close();
         }
@@ -1135,11 +1161,11 @@ impl App {
         let disk_active = snap.disks.iter().map(|d| d.active).fold(0.0, f32::max);
         let disk_rate: f64 = snap.disks.iter().map(|d| d.read + d.write).sum();
         let tiles: [(&str, &str, String, String, &std::collections::VecDeque<f32>, Color32, Option<f32>, usize); 5] = [
-            (I::CPU, "CPU", fmt::pct(snap.cpu_total), format!("{} cores", snap.cores.len()), &sys.0, C_CPU, Some(100.0), 0),
-            (I::MEMORY, "Memory", fmt::bytes(used), format!("of {}", fmt::bytes(snap.mem_total)), &sys.1, C_MEM, Some(100.0), 1),
-            (I::HARD_DRIVES, "Disk", format!("{:.0}%", disk_active), fmt::rate(disk_rate), &sys.4, C_DISK, Some(100.0), 2),
-            (I::WIFI_HIGH, "Network", fmt::bits(snap.net_recv + snap.net_send), format!("↓ {}  ↑ {}", fmt::rate(snap.net_recv), fmt::rate(snap.net_send)), &sys.2, C_NET, None, 3),
-            (I::GRAPHICS_CARD, "GPU", fmt::pct(snap.gpu.util), if snap.gpu.dedicated_used > 0 { format!("{} VRAM", fmt::bytes(snap.gpu.dedicated_used)) } else { String::new() }, &sys.3, C_GPU, Some(100.0), 4),
+            (I::CPU, "CPU", fmt::pct(snap.cpu_total), format!("{} cores", snap.cores.len()), &sys.0, C_CPU(), Some(100.0), 0),
+            (I::MEMORY, "Memory", fmt::bytes(used), format!("of {}", fmt::bytes(snap.mem_total)), &sys.1, C_MEM(), Some(100.0), 1),
+            (I::HARD_DRIVES, "Disk", format!("{:.0}%", disk_active), fmt::rate(disk_rate), &sys.4, C_DISK(), Some(100.0), 2),
+            (I::WIFI_HIGH, "Network", fmt::bits(snap.net_recv + snap.net_send), format!("↓ {}  ↑ {}", fmt::rate(snap.net_recv), fmt::rate(snap.net_send)), &sys.2, C_NET(), None, 3),
+            (I::GRAPHICS_CARD, "GPU", fmt::pct(snap.gpu.util), if snap.gpu.dedicated_used > 0 { format!("{} VRAM", fmt::bytes(snap.gpu.dedicated_used)) } else { String::new() }, &sys.3, C_GPU(), Some(100.0), 4),
         ];
         let offset = self.smooth_offset();
         let w = ((ui.available_width() - 4.0 * 10.0) / 5.0).max(120.0);
@@ -1148,13 +1174,13 @@ impl App {
             for (icon, label, value, sub, data, color, max, perf_idx) in tiles {
                 let (rect, resp) = ui.allocate_exact_size(vec2(w, 74.0), Sense::click());
                 let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                ui.painter().rect(rect, CornerRadius::same(12), lerp_color(CARD, CARD_HI, hover * 0.6), Stroke::new(1.0, lerp_color(BORDER_SOFT, color.gamma_multiply(0.5), hover)), egui::StrokeKind::Inside);
+                ui.painter().rect(rect, CornerRadius::same(12), lerp_color(CARD(), CARD_HI(), hover * 0.6), Stroke::new(1.0, lerp_color(BORDER_SOFT(), color.gamma_multiply(0.5), hover)), egui::StrokeKind::Inside);
                 let spark = egui::Rect::from_min_max(egui::pos2(rect.left() + 1.0, rect.top() + 30.0), egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0));
                 crate::graph::sparkline(ui, spark.shrink2(vec2(1.0, 0.0)), data, color.gamma_multiply(0.85), max, offset);
                 let p = ui.painter();
-                p.text(rect.left_top() + vec2(12.0, 12.0), egui::Align2::LEFT_TOP, format!("{icon}  {label}"), egui::FontId::proportional(12.0), MUTED);
-                p.text(rect.right_top() + vec2(-12.0, 9.0), egui::Align2::RIGHT_TOP, value, bold(17.0), TEXT);
-                p.text(rect.right_top() + vec2(-12.0, 32.0), egui::Align2::RIGHT_TOP, sub, egui::FontId::proportional(11.0), FAINT);
+                p.text(rect.left_top() + vec2(12.0, 12.0), egui::Align2::LEFT_TOP, format!("{icon}  {label}"), egui::FontId::proportional(12.0), MUTED());
+                p.text(rect.right_top() + vec2(-12.0, 9.0), egui::Align2::RIGHT_TOP, value, bold(17.0), TEXT());
+                p.text(rect.right_top() + vec2(-12.0, 32.0), egui::Align2::RIGHT_TOP, sub, egui::FontId::proportional(11.0), FAINT());
                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open in Performance").clicked() {
                     self.page = Page::Performance;
                     self.perf_sel = perf_idx;
@@ -1174,15 +1200,13 @@ impl App {
     }
 
     fn details(&mut self, ui: &mut Ui, p: &Proc, snap: &Snapshot, acts: &mut Vec<Act>) {
-        let ctx = ui.ctx().clone();
         let meta = self.info.meta(p.key(), p.path.as_ref());
         egui::ScrollArea::vertical().id_salt("details-scroll").auto_shrink([false, false]).show(ui, |ui| {
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    let tex = p.path.as_deref().and_then(|path| self.tex(&ctx, path));
                     let (r, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-                    paint_icon(ui, r, tex.as_ref(), I::APP_WINDOW);
+                    self.paint_proc_icon(ui, r, p);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
                         let (name, exe) = self.display_name(p);
@@ -1194,10 +1218,10 @@ impl App {
                             }
                             sub.push_str(&c);
                         }
-                        ui.add(egui::Label::new(RichText::new(sub).size(12.0).color(MUTED)).truncate());
+                        ui.add(egui::Label::new(RichText::new(sub).size(12.0).color(MUTED())).truncate());
                     });
                     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                        if ui.add(egui::Label::new(RichText::new(I::X).color(FAINT)).sense(Sense::click())).on_hover_text("Close details (Enter)").clicked() {
+                        if ui.add(egui::Label::new(RichText::new(I::X).color(FAINT())).sense(Sense::click())).on_hover_text("Close details (Enter)").clicked() {
                             self.details_open = false;
                         }
                     });
@@ -1205,19 +1229,19 @@ impl App {
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
                     if p.window.as_ref().is_some_and(|w| w.hung) {
-                        pill(ui, "Not responding", BAD);
+                        pill(ui, "Not responding", BAD());
                     }
                     if p.suspended {
-                        pill(ui, "Suspended", BLUE);
+                        pill(ui, "Suspended", BLUE());
                     }
                     if meta.as_ref().and_then(|m| m.elevated).unwrap_or(false) {
-                        pill(ui, "Administrator", WARN);
+                        pill(ui, "Administrator", WARN());
                     }
                     if crate::sampler::critical(&p.name) {
-                        pill(ui, "Critical system process", BAD);
+                        pill(ui, "Critical system process", BAD());
                     }
                     if self.cfg.blocked_apps.iter().any(|b| Some(b.as_str()) == p.path.as_deref()) {
-                        pill(ui, "Internet blocked", ORANGE);
+                        pill(ui, "Internet blocked", ORANGE());
                     }
                 });
                 ui.add_space(6.0);
@@ -1256,24 +1280,24 @@ impl App {
             let w = (ui.available_width() - 10.0) / 2.0;
             let metric = |ui: &mut Ui, label: &str, value: String, data: &[f32], color: Color32, max: f32| {
                 let (rect, _) = ui.allocate_exact_size(vec2(w, 70.0), Sense::hover());
-                ui.painter().rect(rect, CornerRadius::same(10), CARD, Stroke::new(1.0, BORDER_SOFT), egui::StrokeKind::Inside);
+                ui.painter().rect(rect, CornerRadius::same(10), CARD(), Stroke::new(1.0, BORDER_SOFT()), egui::StrokeKind::Inside);
                 crate::graph::mini(ui, egui::Rect::from_min_max(rect.left_top() + vec2(1.0, 30.0), rect.right_bottom() - vec2(1.0, 1.0)), data, color, max);
-                ui.painter().text(rect.left_top() + vec2(10.0, 9.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(11.5), FAINT);
+                ui.painter().text(rect.left_top() + vec2(10.0, 9.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(11.5), FAINT());
                 ui.painter().text(rect.right_top() + vec2(-10.0, 8.0), egui::Align2::RIGHT_TOP, value, bold(14.0), color);
             };
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                metric(ui, "CPU", fmt::pct(p.cpu), &cpu, C_CPU, cpu_max);
-                metric(ui, "Memory", fmt::bytes(p.mem), &mem, C_MEM, mem_max);
+                metric(ui, "CPU", fmt::pct(p.cpu), &cpu, C_CPU(), cpu_max);
+                metric(ui, "Memory", fmt::bytes(p.mem), &mem, C_MEM(), mem_max);
             });
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                metric(ui, "Disk / I/O", fmt::rate(p.io_rate), &io, C_DISK, io_max);
+                metric(ui, "Disk / I/O", fmt::rate(p.io_rate), &io, C_DISK(), io_max);
                 if snap.per_app_net {
-                    metric(ui, "Network", fmt::rate(p.net_rate()), &net, C_NET, net_max);
+                    metric(ui, "Network", fmt::rate(p.net_rate()), &net, C_NET(), net_max);
                 } else {
-                    metric(ui, "GPU", fmt::pct(p.gpu), &[], C_GPU, 100.0);
+                    metric(ui, "GPU", fmt::pct(p.gpu), &[], C_GPU(), 100.0);
                 }
             });
             ui.add_space(10.0);
@@ -1284,7 +1308,7 @@ impl App {
                 let parent = snap.procs.iter().find(|x| x.pid == p.ppid && x.create_time <= p.create_time);
                 kv(ui, "PID", &p.pid.to_string());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Parent").color(FAINT));
+                    ui.label(RichText::new("Parent").color(FAINT()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| match parent {
                         Some(pp) => {
                             if ui.link(format!("{} ({})", pp.name, pp.pid)).clicked() {
@@ -1293,7 +1317,7 @@ impl App {
                             }
                         }
                         None => {
-                            ui.label(RichText::new(format!("{} (exited)", p.ppid)).color(MUTED));
+                            ui.label(RichText::new(format!("{} (exited)", p.ppid)).color(MUTED()));
                         }
                     });
                 });
@@ -1323,8 +1347,8 @@ impl App {
                     label_caps(ui, &format!("Hosts {} service{}", svcs.len(), if svcs.len() == 1 { "" } else { "s" }));
                     for (n, d) in svcs.iter().take(30) {
                         ui.horizontal(|ui| {
-                            ui.add(egui::Label::new(RichText::new(d).color(TEXT)).truncate());
-                            ui.label(RichText::new(n).size(11.0).color(FAINT));
+                            ui.add(egui::Label::new(RichText::new(d).color(TEXT())).truncate());
+                            ui.label(RichText::new(n).size(11.0).color(FAINT()));
                         });
                     }
                 });
@@ -1344,7 +1368,7 @@ impl App {
                             }
                         });
                     });
-                    ui.add(egui::Label::new(RichText::new(path).size(12.0).color(MUTED)).wrap());
+                    ui.add(egui::Label::new(RichText::new(path).size(12.0).color(MUTED())).wrap());
                     if let Some(c) = meta.as_ref().and_then(|m| m.cmdline.clone()) {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
@@ -1355,9 +1379,9 @@ impl App {
                                 }
                             });
                         });
-                        egui::Frame::new().fill(FIELD).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                        egui::Frame::new().fill(FIELD()).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.add(egui::Label::new(RichText::new(c).monospace().size(11.5).color(MUTED)).wrap());
+                            ui.add(egui::Label::new(RichText::new(c).monospace().size(11.5).color(MUTED())).wrap());
                         });
                     }
                 });
@@ -1381,7 +1405,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add(egui::Label::new(RichText::new(format!("{host}:{}", r.port())).size(12.0)).truncate());
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new(crate::net::tcp_state(c.state)).size(11.0).color(FAINT));
+                                ui.label(RichText::new(crate::net::tcp_state(c.state)).size(11.0).color(FAINT()));
                             });
                         });
                     }
@@ -1396,7 +1420,6 @@ impl App {
             self.sel_group = None;
             return;
         }
-        let ctx = ui.ctx().clone();
         let first = members[0];
         let (name, _) = self.display_name(first);
         let cpu: f32 = members.iter().map(|p| p.cpu).sum();
@@ -1405,12 +1428,11 @@ impl App {
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    let tex = first.path.as_deref().and_then(|path| self.tex(&ctx, path));
                     let (r, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-                    paint_icon(ui, r, tex.as_ref(), I::APP_WINDOW);
+                    self.paint_proc_icon(ui, r, first);
                     ui.vertical(|ui| {
                         ui.add(egui::Label::new(RichText::new(&name).font(bold(15.5))).truncate());
-                        ui.label(RichText::new(format!("{} processes · {} · {}", members.len(), fmt::pct(cpu), fmt::bytes(mem))).size(12.0).color(MUTED));
+                        ui.label(RichText::new(format!("{} processes · {} · {}", members.len(), fmt::pct(cpu), fmt::bytes(mem))).size(12.0).color(MUTED()));
                     });
                 });
                 ui.add_space(8.0);
@@ -1437,7 +1459,7 @@ impl App {
                         ui.add(egui::Label::new(RichText::new(title).size(12.5)).truncate().sense(Sense::click()))
                     });
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} · {} · PID {}", fmt::pct(p.cpu), fmt::bytes(p.mem), p.pid)).size(11.0).color(FAINT));
+                        ui.label(RichText::new(format!("{} · {} · PID {}", fmt::pct(p.cpu), fmt::bytes(p.mem), p.pid)).size(11.0).color(FAINT()));
                     });
                     if r.inner.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         acts.push(Act::Select(p.key()));
@@ -1468,16 +1490,16 @@ impl Usage {
         const MB: f64 = 1048576.0;
         // (text, load 0..1 for the bar, severity 0..1 for color, idle?)
         let (text, load, sev, idle, color) = match c {
-            Col::Cpu => (fmt::pct(self.cpu), self.cpu / 100.0, self.cpu / 60.0, self.cpu < 0.05, C_CPU),
-            Col::Gpu => (fmt::pct(self.gpu), self.gpu / 100.0, self.gpu / 70.0, self.gpu < 0.05, C_GPU),
+            Col::Cpu => (fmt::pct(self.cpu), self.cpu / 100.0, self.cpu / 60.0, self.cpu < 0.05, C_CPU()),
+            Col::Gpu => (fmt::pct(self.gpu), self.gpu / 100.0, self.gpu / 70.0, self.gpu < 0.05, C_GPU()),
             Col::Memory => {
                 let share = (self.mem as f64 / total_mem) as f32;
                 // Relative to installed RAM: amber from ~7.5%, red from ~15% of memory.
-                (fmt::bytes(self.mem), share * 4.0, share / 0.15, self.mem < 8 * 1048576, C_MEM)
+                (fmt::bytes(self.mem), share * 4.0, share / 0.15, self.mem < 8 * 1048576, C_MEM())
             }
-            Col::Disk => (if self.io < 1.0 { "0 MB/s".into() } else { fmt::rate(self.io) }, (self.io / (50.0 * MB)) as f32, (self.io / (80.0 * MB)) as f32, self.io < 1024.0, C_DISK),
-            Col::Network if !per_app_net => ("—".into(), 0.0, 0.0, true, C_NET),
-            Col::Network => (if self.net < 1.0 { "0 MB/s".into() } else { fmt::rate(self.net) }, (self.net / (5.0 * MB)) as f32, (self.net / (12.0 * MB)) as f32, self.net < 1024.0, C_NET),
+            Col::Disk => (if self.io < 1.0 { "0 MB/s".into() } else { fmt::rate(self.io) }, (self.io / (50.0 * MB)) as f32, (self.io / (80.0 * MB)) as f32, self.io < 1024.0, C_DISK()),
+            Col::Network if !per_app_net => ("—".into(), 0.0, 0.0, true, C_NET()),
+            Col::Network => (if self.net < 1.0 { "0 MB/s".into() } else { fmt::rate(self.net) }, (self.net / (5.0 * MB)) as f32, (self.net / (12.0 * MB)) as f32, self.net < 1024.0, C_NET()),
             _ => return,
         };
         let r = ui.max_rect();
@@ -1492,15 +1514,15 @@ impl Usage {
             ui.painter().rect_filled(bar, CornerRadius::same(1), color.gamma_multiply(0.85));
         }
         let rt = if idle {
-            RichText::new(text).color(FAINT)
+            RichText::new(text).color(FAINT())
         } else if sev >= 1.0 {
-            RichText::new(text).font(bold(13.5)).color(BAD)
+            RichText::new(text).font(bold(13.5)).color(BAD())
         } else if sev >= 0.5 {
-            RichText::new(text).font(bold(13.5)).color(WARN)
+            RichText::new(text).font(bold(13.5)).color(WARN())
         } else if load >= 0.08 || sev >= 0.15 {
-            RichText::new(text).font(bold(13.5)).color(TEXT)
+            RichText::new(text).font(bold(13.5)).color(TEXT())
         } else {
-            RichText::new(text).color(MUTED)
+            RichText::new(text).color(MUTED())
         };
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(rt);
@@ -1514,37 +1536,36 @@ fn num_cell(ui: &mut Ui, text: &str, bg: Color32) {
         ui.painter().rect_filled(r, CornerRadius::ZERO, bg);
     }
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.label(RichText::new(text).color(TEXT));
+        ui.label(RichText::new(text).color(TEXT()));
     });
 }
 
 fn kv(ui: &mut Ui, k: &str, v: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(k).color(FAINT));
+        ui.label(RichText::new(k).color(FAINT()));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add(egui::Label::new(RichText::new(v).color(TEXT)).truncate());
+            ui.add(egui::Label::new(RichText::new(v).color(TEXT())).truncate());
         });
     });
 }
 
 /// Sortable header cell with an optional total on top. Returns true when clicked.
-fn header_cell(ui: &mut Ui, label: &str, total: Option<&str>, active: bool, desc: bool, right: bool) -> bool {
-    let layout = if right { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
-    let resp = ui
-        .with_layout(layout, |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let arrow = if active { if desc { I::CARET_DOWN } else { I::CARET_UP } } else { "" };
-            let text = match total {
-                Some(t) => format!("{t}"),
-                None => String::new(),
-            };
-            let col = if active { ACCENT_HI } else { MUTED };
-            let r = ui.add(egui::Label::new(RichText::new(format!("{}{}{}", if right { arrow } else { "" }, label, if right { "" } else { arrow })).font(bold(11.5)).color(col)).sense(Sense::click()).selectable(false));
-            if !text.is_empty() {
-                ui.label(RichText::new(text).size(11.0).color(FAINT));
-            }
-            r
-        })
-        .inner;
+/// Sortable header cell: the system total big and coloured on top, the column name below.
+/// Returns true when clicked.
+fn header_cell(ui: &mut Ui, label: &str, total: Option<&str>, color: Color32, active: bool, desc: bool, right: bool) -> bool {
+    let rect = ui.max_rect();
+    let resp = ui.interact(rect, ui.scope_id().with(("hdr", label)), Sense::click());
+    let arrow = if active { if desc { I::CARET_DOWN } else { I::CARET_UP } } else { "" };
+    let name = if right { format!("{arrow}{}", label.to_uppercase()) } else { format!("{}{arrow}", label.to_uppercase()) };
+    let name_col = if active { ACCENT_HI() } else if resp.hovered() { TEXT() } else { MUTED() };
+    let (align_x, x) = if right { (egui::Align2::RIGHT_BOTTOM, rect.right()) } else { (egui::Align2::LEFT_BOTTOM, rect.left()) };
+    let p = ui.painter();
+    let name_font = bold(10.5);
+    if let Some(t) = total {
+        p.text(egui::pos2(x, rect.top() + 23.0), align_x, t, bold(15.5), color);
+        p.text(egui::pos2(x, rect.bottom() - 4.0), align_x, name, name_font, name_col);
+    } else {
+        p.text(egui::pos2(x, rect.bottom() - 4.0), align_x, name, name_font, name_col);
+    }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }

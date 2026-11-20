@@ -105,7 +105,7 @@ fn local_offset_secs() -> i64 {
 }
 
 /// (year, month, day, hour, minute, second) in local time.
-fn civil(unix: i64) -> (i64, u32, u32, u32, u32, u32) {
+pub fn civil(unix: i64) -> (i64, u32, u32, u32, u32, u32) {
     let t = unix + local_offset_secs();
     let days = t.div_euclid(86400);
     let rem = t.rem_euclid(86400);

@@ -109,7 +109,8 @@ pub enum Col {
 }
 
 impl Col {
-    pub const ALL: [Col; 15] = [Col::Pid, Col::Status, Col::Cpu, Col::Memory, Col::Disk, Col::Network, Col::Gpu, Col::GpuMem, Col::Threads, Col::Handles, Col::Priority, Col::Started, Col::Conns, Col::Path, Col::CommandLine];
+    /// Usage columns first, then the optional extras (Columns menu shows them in two groups).
+    pub const ALL: [Col; 15] = [Col::Cpu, Col::Memory, Col::Disk, Col::Network, Col::Gpu, Col::Pid, Col::Status, Col::GpuMem, Col::Threads, Col::Handles, Col::Priority, Col::Started, Col::Conns, Col::Path, Col::CommandLine];
     pub fn label(self) -> &'static str {
         match self {
             Col::Pid => "PID",
@@ -161,6 +162,20 @@ pub struct Config {
     pub history_days: u32,
     pub first_run_done: bool,
     pub always_on_top: bool,
+    pub light_theme: bool,
+    pub accent: usize,
+    /// Whole-UI zoom (text size slider).
+    pub text_scale: f32,
+    pub compact_rows: bool,
+    /// Tiny always-on-top metrics overlay.
+    pub overlay: bool,
+    /// 0 = top-right, 1 = top-left, 2 = bottom-right, 3 = bottom-left.
+    pub overlay_corner: usize,
+    /// Exe name of the last selected process, restored on the next start.
+    pub last_selected: Option<String>,
+    /// Bumped when the default layout changes; older configs are migrated once on load.
+    #[serde(default)]
+    pub layout_version: u32,
     pub startup_sort: (usize, bool),
 }
 
@@ -169,7 +184,7 @@ impl Default for Config {
         Self {
             refresh_ms: 1000,
             view: ViewMode::Grouped,
-            columns: vec![Col::Status, Col::Cpu, Col::Memory, Col::Disk, Col::Network, Col::Gpu, Col::Pid],
+            columns: vec![Col::Cpu, Col::Memory, Col::Disk, Col::Network, Col::Gpu],
             sort_col: Some(Col::Cpu),
             sort_desc: true,
             pinned: Vec::new(),
@@ -190,6 +205,14 @@ impl Default for Config {
             history_days: 7,
             first_run_done: false,
             always_on_top: false,
+            light_theme: false,
+            accent: 0,
+            text_scale: 1.0,
+            compact_rows: false,
+            overlay: false,
+            overlay_corner: 0,
+            last_selected: None,
+            layout_version: 2,
             startup_sort: (0, false),
         }
     }
@@ -211,6 +234,13 @@ impl Config {
         let mut c: Self = std::fs::read(data_dir().join("config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         // Single-user PC: the User column is gone (kept in the enum so old configs still parse).
         c.columns.retain(|x| *x != Col::User);
+        if c.layout_version < 2 {
+            // v2: Status and PID became extras (status shows inline, PID on hover / in details).
+            c.columns.retain(|x| *x != Col::Status && *x != Col::Pid);
+            c.layout_version = 2;
+        }
+        let order: Vec<Col> = Col::ALL.iter().copied().filter(|x| c.columns.contains(x)).collect();
+        c.columns = order;
         if c.sort_col == Some(Col::User) {
             c.sort_col = Some(Col::Cpu);
         }

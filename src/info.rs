@@ -24,7 +24,8 @@ struct PathMeta {
 }
 
 enum Job {
-    Proc(Key, Option<Arc<str>>),
+    /// Process, its path, and the paths of its ancestors (nearest first) for icon fallback.
+    Proc(Key, Option<Arc<str>>, Vec<Arc<str>>),
     Icon(String),
 }
 
@@ -36,7 +37,18 @@ struct State {
     queue: VecDeque<Job>,
     pending: HashSet<Key>,
     pending_icons: HashSet<String>,
+    own_icon: HashMap<String, bool>,
     ctx: Option<egui::Context>,
+}
+
+/// Launchers/shells whose icon would be misleading for a child process.
+fn skip_parent(path: &str) -> bool {
+    let f = std::path::Path::new(path).file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+    matches!(
+        f.as_str(),
+        "explorer.exe" | "svchost.exe" | "services.exe" | "wininit.exe" | "winlogon.exe" | "userinit.exe" | "sihost.exe" | "taskhostw.exe" | "cmd.exe" | "conhost.exe"
+            | "powershell.exe" | "pwsh.exe" | "windowsterminal.exe" | "openconsole.exe" | "sentinel.exe" | "runtimebroker.exe" | "dllhost.exe" | "wmiprvse.exe" | "taskeng.exe"
+    )
 }
 
 pub struct Info {
@@ -79,7 +91,7 @@ impl Info {
                 st.queue.pop_front().unwrap()
             };
             match job {
-                Job::Proc(key, path) => {
+                Job::Proc(key, path, parents) => {
                     let pm = path.as_ref().map(|p| {
                         let cached = self.st.lock().unwrap().by_path.get(&**p).cloned();
                         cached.unwrap_or_else(|| {
@@ -95,7 +107,7 @@ impl Info {
                         user: crate::win::process_user(key.0),
                         elevated: crate::win::process_is_elevated(key.0),
                         cmdline: crate::win::command_line(key.0),
-                        icon_key: path.as_ref().map(|p| p.to_string()),
+                        icon_key: self.icon_for(path.as_deref(), &parents),
                     };
                     if let Some(p) = &path {
                         self.load_icon(p);
@@ -136,10 +148,40 @@ impl Info {
             return Some(m.clone());
         }
         if st.pending.insert(key) {
-            st.queue.push_back(Job::Proc(key, path.cloned()));
+            st.queue.push_back(Job::Proc(key, path.cloned(), Vec::new()));
             self.cv.notify_one();
         }
         None
+    }
+
+    /// Like `meta`, but also hands over the process's ancestors (used by the sampler, which knows
+    /// them) so an exe without its own icon can borrow its parent app's icon.
+    pub fn warm(&self, key: Key, path: Option<&Arc<str>>, parents: impl FnOnce() -> Vec<Arc<str>>) {
+        let mut st = self.st.lock().unwrap();
+        if st.by_key.contains_key(&key) || st.pending.contains(&key) {
+            return;
+        }
+        st.pending.insert(key);
+        st.queue.push_back(Job::Proc(key, path.cloned(), parents()));
+        self.cv.notify_one();
+    }
+
+    fn own_icon(&self, path: &str) -> bool {
+        if let Some(&b) = self.st.lock().unwrap().own_icon.get(path) {
+            return b;
+        }
+        let b = crate::win::has_own_icon(path);
+        self.st.lock().unwrap().own_icon.insert(path.to_string(), b);
+        b
+    }
+
+    /// The exe's own icon, else the nearest parent app's icon, else None (UI draws a letter badge).
+    fn icon_for(&self, path: Option<&str>, parents: &[Arc<str>]) -> Option<String> {
+        let path = path?;
+        if self.own_icon(path) {
+            return Some(path.to_string());
+        }
+        parents.iter().find(|p| !skip_parent(p) && self.own_icon(p)).map(|p| p.to_string())
     }
 
     /// Icon for a file path or "path,index" resource spec. None while loading or if there is none.

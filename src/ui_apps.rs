@@ -5,7 +5,7 @@ use crate::apps::{self, App as InstalledApp, Health};
 use crate::fmt;
 use crate::icons as I;
 use crate::theme::*;
-use egui::{Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Ui, vec2};
+use egui::{Align, CornerRadius, Layout, RichText, Sense, Stroke, Ui, vec2};
 use egui_extras::{Column, TableBuilder};
 
 enum AppAct {
@@ -37,16 +37,16 @@ impl App {
         });
         if self.apps.is_none() {
             ui.horizontal(|ui| {
-                spinner(ui, 18.0, ACCENT_HI);
-                ui.label(RichText::new("Reading installed programs…").color(MUTED));
+                spinner(ui, 18.0, ACCENT_HI());
+                ui.label(RichText::new("Reading installed programs…").color(MUTED()));
             });
             return;
         }
         if broken > 0 && self.apps_filter != 1 {
-            egui::Frame::new().fill(Color32::from_rgb(44, 22, 28)).stroke(Stroke::new(1.0, BAD.gamma_multiply(0.35))).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 9)).show(ui, |ui| {
+            egui::Frame::new().fill(BAD().gamma_multiply(0.12)).stroke(Stroke::new(1.0, BAD().gamma_multiply(0.35))).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 9)).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(I::GHOST).color(BAD).size(17.0));
-                    ui.label(RichText::new(format!("{broken} app{} can't be uninstalled because {} files were already deleted.", if broken == 1 { "" } else { "s" }, if broken == 1 { "its" } else { "their" })).color(TEXT));
+                    ui.label(RichText::new(I::GHOST).color(BAD()).size(17.0));
+                    ui.label(RichText::new(format!("{broken} app{} can't be uninstalled because {} files were already deleted.", if broken == 1 { "" } else { "s" }, if broken == 1 { "its" } else { "their" })).color(TEXT()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if button_sized(ui, Btn::Primary, I::BROOM, "Review and clean up", true, 28.0).clicked() {
                             self.apps_filter = 1;
@@ -63,7 +63,7 @@ impl App {
                 self.apps_filter = f;
                 self.apps_checked.clear();
             }
-            ui.label(RichText::new("Sort").color(FAINT));
+            ui.label(RichText::new("Sort").color(FAINT()));
             let sorts = ["Name", "Size", "Install date", "Publisher"];
             egui::ComboBox::from_id_salt("apps-sort").selected_text(sorts[self.apps_sort]).width(120.0).show_ui(ui, |ui| {
                 for (i, s) in sorts.iter().enumerate() {
@@ -110,7 +110,7 @@ impl App {
                         self.apps_checked.clear();
                     }
                 }
-                ui.label(RichText::new("Broken = the uninstaller is gone. Files missing = the install folder is gone, the uninstaller might still work.").size(12.0).color(FAINT));
+                ui.label(RichText::new("Broken = the uninstaller is gone. Files missing = the install folder is gone, the uninstaller might still work.").size(12.0).color(FAINT()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if button(ui, Btn::Danger, I::TRASH, &format!("Remove {n} entr{}", if n == 1 { "y" } else { "ies" }), n > 0).clicked() {
                         acts.push(AppAct::Remove(rows.iter().filter(|a| self.apps_checked.contains(&a.id())).map(|a| (*a).clone()).collect()));
@@ -123,7 +123,7 @@ impl App {
             empty_state(ui, if bulk { I::CHECK_CIRCLE } else { I::PACKAGE }, if bulk { "No broken entries" } else { "No apps match" }, if bulk { "Every installed app still has its uninstaller." } else { "Try a different search or filter." });
             return;
         }
-        egui::Frame::new().fill(CARD).stroke(Stroke::new(1.0, BORDER_SOFT)).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+        egui::Frame::new().fill(CARD()).stroke(Stroke::new(1.0, BORDER_SOFT())).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             let mut tb = TableBuilder::new(ui).id_salt("apps").striped(false).sense(Sense::click()).cell_layout(Layout::left_to_right(Align::Center)).auto_shrink([false, false]);
             if bulk {
                 tb = tb.column(Column::exact(26.0));
@@ -140,7 +140,7 @@ impl App {
                     }
                     for t in ["App", "Version", "Size", "Installed", "Status", ""] {
                         h.col(|ui| {
-                            ui.label(RichText::new(t).font(bold(11.5)).color(MUTED));
+                            ui.label(RichText::new(t).font(bold(11.5)).color(MUTED()));
                         });
                     }
                 })
@@ -172,24 +172,24 @@ impl App {
                                     apps::Scope::User => format!("{}  ·  just you", a.publisher),
                                     _ => a.publisher.clone(),
                                 };
-                                ui.add(egui::Label::new(RichText::new(sub).size(11.5).color(FAINT)).truncate());
+                                ui.add(egui::Label::new(RichText::new(sub).size(11.5).color(FAINT())).truncate());
                             });
                         });
                         row.col(|ui| {
-                            ui.add(egui::Label::new(RichText::new(&a.version).size(12.0).color(MUTED)).truncate());
+                            ui.add(egui::Label::new(RichText::new(&a.version).size(12.0).color(MUTED())).truncate());
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(if a.size_kb > 0 { fmt::bytes(a.size_kb * 1024) } else { String::new() }).size(12.0).color(MUTED));
+                            ui.label(RichText::new(if a.size_kb > 0 { fmt::bytes(a.size_kb * 1024) } else { String::new() }).size(12.0).color(MUTED()));
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(fmt::install_date(&a.install_date)).size(12.0).color(MUTED));
+                            ui.label(RichText::new(fmt::install_date(&a.install_date)).size(12.0).color(MUTED()));
                         });
                         row.col(|ui| match a.health {
                             Health::Broken => {
-                                pill(ui, "Broken", BAD).on_hover_text(format!("Uninstaller missing:\n{}", a.uninstaller_exe));
+                                pill(ui, "Broken", BAD()).on_hover_text(format!("Uninstaller missing:\n{}", a.uninstaller_exe));
                             }
                             Health::FilesMissing => {
-                                pill(ui, "Files missing", WARN).on_hover_text(format!("Install folder is gone:\n{}", a.location));
+                                pill(ui, "Files missing", WARN()).on_hover_text(format!("Install folder is gone:\n{}", a.location));
                             }
                             Health::Ok => {}
                         });
@@ -247,7 +247,7 @@ impl App {
                 ui.close();
             }
         }
-        if ui.button(RichText::new(format!("{}  Remove entry from list", I::FILE_X)).color(BAD)).on_hover_text("Deletes only the registry entry (a .reg backup is saved first)").clicked() {
+        if ui.button(RichText::new(format!("{}  Remove entry from list", I::FILE_X)).color(BAD())).on_hover_text("Deletes only the registry entry (a .reg backup is saved first)").clicked() {
             acts.push(AppAct::Remove(vec![a.clone()]));
             ui.close();
         }

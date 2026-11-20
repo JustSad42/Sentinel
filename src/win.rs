@@ -269,6 +269,12 @@ pub fn file_icon_rgba(path: &str, size: u32) -> Option<(u32, u32, Vec<u8>)> {
     }
 }
 
+/// True when the file has an embedded icon (otherwise the shell would show the generic exe icon).
+pub fn has_own_icon(path: &str) -> bool {
+    let w = wide(path);
+    unsafe { ExtractIconExW(w.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0) > 0 }
+}
+
 /// Icon from a "path,index" resource string (DisplayIcon style).
 pub fn resource_icon_rgba(spec: &str) -> Option<(u32, u32, Vec<u8>)> {
     let spec = expand_env(spec.trim().trim_matches('"'));
