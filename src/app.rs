@@ -122,6 +122,10 @@ pub struct App {
     pub sort_cache: std::cell::RefCell<crate::ui_procs::SortCache>,
     pub palette: crate::palette::Palette,
     pub overlay_styled: bool,
+    /// When the window was last shown / hidden, and whether it has had focus since showing.
+    shown_at: Instant,
+    hidden_at: Instant,
+    had_focus: bool,
     /// (opacity, click-through) last applied to the overlay window.
     pub overlay_style: (f32, bool),
     /// Exe name to re-select once its process shows up (selection survives restarts).
@@ -313,6 +317,9 @@ impl App {
             sort_cache: Default::default(),
             palette: crate::palette::Palette::test_open(),
             overlay_styled: false,
+            shown_at: Instant::now(),
+            hidden_at: Instant::now(),
+            had_focus: false,
             overlay_style: (1.0, false),
             pending_select: cfg.last_selected.clone(),
             pending_locks: integration::take_locks_request(),
@@ -552,6 +559,7 @@ impl App {
             return;
         }
         self.visible = false;
+        self.hidden_at = Instant::now();
         self.ctl.visible.store(false, Ordering::Relaxed);
         self.latency.active.store(false, Ordering::Relaxed);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -679,6 +687,9 @@ impl App {
 
     fn on_show(&mut self, ctx: &egui::Context) {
         self.visible = true;
+        self.shown_at = Instant::now();
+        self.had_focus = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         self.ctl.visible.store(true, Ordering::Relaxed);
         self.ctl.refresh();
         self.elevated = win::is_elevated();
@@ -1099,9 +1110,19 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.hide(ctx);
         }
-        if self.cfg.hide_on_focus_loss && self.visible && self.modal.is_none() {
-            let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-            if !focused && ctx.input(|i| i.time) > 2.0 {
+        // Safety net: the window is on screen (shown by Windows directly, e.g. by the show listener)
+        // but we think it's hidden, which would leave it blank. Treat it as shown.
+        if !self.visible && !self.quit && self.hidden_at.elapsed() > Duration::from_millis(800) && win::is_window_visible(self.hwnd as _) {
+            self.on_show(ctx);
+        }
+        if self.visible {
+            let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+            if focused {
+                self.had_focus = true;
+            }
+            // Only hide on focus loss after the window really had focus since it was shown; the focus
+            // state right after showing is stale (it still says "not focused" from while hidden).
+            if self.cfg.hide_on_focus_loss && self.modal.is_none() && self.had_focus && !focused && self.shown_at.elapsed() > Duration::from_millis(1200) {
                 self.hide(ctx);
             }
         }

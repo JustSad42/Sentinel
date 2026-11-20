@@ -561,3 +561,4 @@ pub fn trim_working_set() {
         SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
 }
+
