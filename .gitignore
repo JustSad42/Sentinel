@@ -1,0 +1,5 @@
+target/
+dist/
+out/
+graphify-out/
+*.pdb
