@@ -61,8 +61,21 @@ impl App {
         let snap = self.snap.clone();
         header(ui, "Performance", &format!("{}  ·  up {}", cpu_name(), fmt::duration(crate::win::uptime_secs())), |ui| {
             let mut r = self.perf_range;
-            if segmented(ui, &mut r, &["Live", "1 hour", "24 hours"]) {
+            if segmented(ui, &mut r, &["Live", "1 hour", "24 hours", "7 days"]) {
                 self.perf_range = r;
+                self.perf_zoom = None;
+                self.perf_pick = None;
+            }
+            let mut ex = self.perf_expanded;
+            if chip(ui, &mut ex, &format!("{} Expand", I::FRAME_CORNERS), None).on_hover_text("Make the graphs fill the window (Esc to go back)").clicked() {
+                self.perf_expanded = ex;
+            }
+            if let Some((a, b)) = self.perf_zoom {
+                let mut on = true;
+                let lbl = format!("{} {} – {}", I::X, graph::time_label(a, if b - a > 86400.0 { 86400.0 } else { 60.0 }), graph::time_label(b, if b - a > 86400.0 { 86400.0 } else { 60.0 }));
+                if chip(ui, &mut on, &lbl, None).on_hover_text("Zoomed in. Click (or double-click a graph) to reset").clicked() {
+                    self.perf_zoom = None;
+                }
             }
             if self.perf_range == 0 {
                 let mut on = self.cfg.smooth_graphs;
@@ -93,10 +106,30 @@ impl App {
                 _ => list.iter().position(|r| matches!(r, Res::Gpu)).unwrap_or(0),
             }
         };
-        let long_range = [0i64, 3600, 86400][self.perf_range.min(2)];
+        let long_range = [0i64, 3600, 86400, 7 * 86400][self.perf_range.min(3)];
         let offset = if long_range > 0 { 0.0 } else { self.smooth_offset() };
+        if self.perf_expanded && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.perf_expanded = false;
+        }
+        let now = crate::win::now_unix();
+        let (ws, we) = match self.perf_zoom {
+            Some(z) if long_range > 0 => z,
+            _ => ((now - long_range) as f64, now as f64),
+        };
+        let long = if long_range > 0 {
+            let key = (ws as i64 / 10, we as i64 / 10, self.perf_range);
+            match &self.perf_cache {
+                Some((k, c)) if *k == key => c.clone(),
+                _ => {
+                    let c = std::rc::Rc::new(LongSeries::build(&self.shared.lock().unwrap(), ws, we));
+                    self.perf_cache = Some((key, c.clone()));
+                    c
+                }
+            }
+        } else {
+            std::rc::Rc::new(LongSeries::default())
+        };
         let sh = self.shared.lock().unwrap();
-        let long_pts: Vec<crate::sampler::LongPoint> = if long_range > 0 { sh.long.iter().filter(|p| p.t >= crate::win::now_unix() - long_range).copied().collect() } else { Vec::new() };
         let sys = &sh.sys;
         // Copy what we need so the lock is short.
         let cpu = sys.cpu.clone();
@@ -168,47 +201,33 @@ impl App {
 
         // Long ranges: HIST buckets of averages, so the same graphs can draw them.
         let (cpu, mem, gpu, disk_a, disk_r, disk_w, ad_s, ad_r, gpu_temp, interval_long) = if long_range > 0 {
-            let n = crate::sampler::HIST;
-            let bw = long_range as f32 / n as f32;
-            let start = crate::win::now_unix() - long_range;
-            let series = |f: &dyn Fn(&crate::sampler::LongPoint) -> f32| -> VecDeque<f32> {
-                let mut sums = vec![(0.0f32, 0u32); n];
-                for p in &long_pts {
-                    let i = (((p.t - start) as f32) / bw) as usize;
-                    let v = f(p);
-                    if i < n && !v.is_nan() {
-                        sums[i].0 += v;
-                        sums[i].1 += 1;
-                    }
-                }
-                sums.iter().map(|(s, c)| if *c > 0 { s / *c as f32 } else { f32::NAN }).collect()
-            };
-            let all = |m: VecDeque<f32>| -> std::collections::HashMap<String, VecDeque<f32>> { list.iter().filter_map(|r| match r { Res::Disk(n) | Res::Net(n) => Some((n.clone(), m.clone())), _ => None }).collect() };
-            (
-                series(&|p| p.cpu),
-                series(&|p| p.mem),
-                series(&|p| p.gpu),
-                all(series(&|p| p.disk_active)),
-                all(series(&|p| p.disk_r)),
-                all(series(&|p| p.disk_w)),
-                all(series(&|p| p.up)),
-                all(series(&|p| p.down)),
-                series(&|p| p.gpu_temp),
-                bw,
-            )
+            let all = |m: &VecDeque<f32>| -> std::collections::HashMap<String, VecDeque<f32>> { list.iter().filter_map(|r| match r { Res::Disk(n) | Res::Net(n) => Some((n.clone(), m.clone())), _ => None }).collect() };
+            (long.cpu.clone(), long.mem.clone(), long.gpu.clone(), all(&long.disk_a), all(&long.disk_r), all(&long.disk_w), all(&long.up), all(&long.down), long.gpu_temp.clone(), long.bw)
         } else {
             (cpu, mem, gpu, disk_a, disk_r, disk_w, ad_s, ad_r, VecDeque::new(), 0.0)
         };
         let empty_q: VecDeque<f32> = VecDeque::new();
         let long_note = if long_range > 0 {
-            let have = long_pts.first().map(|p| crate::win::now_unix() - p.t).unwrap_or(0);
-            Some(if have + 120 < long_range { format!("Averages · {} recorded so far (Sentinel records in the background)", fmt::duration(have.max(0) as u64)) } else { "Averages over the period".to_string() })
+            let have = now - long.first_t;
+            let zoomed = self.perf_zoom.is_some();
+            Some(if long.first_t == 0 {
+                "Nothing recorded yet. Sentinel records in the background.".to_string()
+            } else if have + 120 < long_range && !zoomed {
+                format!("Averages · {} recorded so far (Sentinel records in the background)", fmt::duration(have.max(0) as u64))
+            } else {
+                format!("Averages of {} each  ·  drag across a graph to zoom, click a moment to see what was running", fmt::duration(long.bw.round() as u64))
+            })
         } else {
             None
         };
+        let expanded = self.perf_expanded && !matches!(list[sel], Res::System);
+        let view_h = ui.available_height();
+        let gx = Gx { end: if long_range > 0 { we } else { now_f() - (offset * snap.interval.max(0.25)) as f64 }, long: long_range > 0 };
         egui::ScrollArea::vertical().id_salt("perf-detail").auto_shrink([false, false]).show(ui, |ui| {
             let w = ui.available_width();
             let interval = if long_range > 0 { interval_long } else { snap.interval.max(0.25) };
+            // Expanded: graphs share the window height; otherwise their usual sizes.
+            let tall = |base: f32, n: f32| if expanded { ((view_h - 150.0) / n - 34.0).max(base) } else { base };
             if let Some(n) = &long_note {
                 ui.label(RichText::new(format!("{}  {n}", I::CLOCK)).size(12.0).color(FAINT()));
                 ui.add_space(4.0);
@@ -216,8 +235,13 @@ impl App {
             match &list[sel] {
                 Res::Cpu => {
                     big_title(ui, "CPU", cpu_name(), &fmt::pct(snap.cpu_total), C_CPU());
-                    let rect = alloc(ui, w, 240.0);
-                    graph::graph(ui, rect, &[Series { data: &cpu, color: C_CPU(), label: "Total" }, Series { data: if long_range > 0 { &empty_q } else { &cpu_k }, color: BLUE().gamma_multiply(0.7), label: "Kernel" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
+                    let rect = alloc(ui, w, tall(240.0, 1.0));
+                    let pf = |v: f32| format!("{v:.0}%");
+                    self.pgraph(ui, rect, &[Series { data: &cpu, color: C_CPU(), label: "Total" }, Series { data: if long_range > 0 { &empty_q } else { &cpu_k }, color: BLUE().gamma_multiply(0.7), label: "Kernel" }], &Opts { max: Some(100.0), fmt: &pf, offset, grid: true, rounded: true, interval }, &gx, false);
+                    graph::range_stats(ui, &cpu, &pf, gx.end, interval, C_CPU());
+                    if expanded {
+                        return;
+                    }
                     ui.add_space(10.0);
                     let x = &snap.extra;
                     let st = crate::hw::statics().map(|s| s.cpu.clone()).unwrap_or_default();
@@ -300,8 +324,13 @@ impl App {
                 Res::Mem => {
                     let used = snap.mem_total.saturating_sub(snap.mem_avail);
                     big_title(ui, "Memory", &format!("{} installed", fmt::bytes(snap.mem_total)), &fmt::bytes(used), C_MEM());
-                    let rect = alloc(ui, w, 220.0);
-                    graph::graph(ui, rect, &[Series { data: &mem, color: C_MEM(), label: "In use" }, Series { data: &commit, color: PINK().gamma_multiply(0.6), label: "Committed" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
+                    let rect = alloc(ui, w, tall(220.0, 1.0));
+                    let pf = |v: f32| format!("{v:.0}%");
+                    self.pgraph(ui, rect, &[Series { data: &mem, color: C_MEM(), label: "In use" }, Series { data: if long_range > 0 { &empty_q } else { &commit }, color: PINK().gamma_multiply(0.6), label: "Committed" }], &Opts { max: Some(100.0), fmt: &pf, offset, grid: true, rounded: true, interval }, &gx, true);
+                    graph::range_stats(ui, &mem, &pf, gx.end, interval, C_MEM());
+                    if expanded {
+                        return;
+                    }
                     ui.add_space(12.0);
                     label_caps(ui, "Composition");
                     let r = alloc(ui, w, 18.0);
@@ -395,11 +424,17 @@ impl App {
                     let sub = [info.model.clone(), format!("{} {kind}", info.bus).trim().to_string(), if info.size > 0 { fmt::bytes(info.size) } else { String::new() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ·  ");
                     big_title(ui, &format!("Disk {n}"), &sub, &format!("{:.0}% active", d.active), C_DISK());
                     let empty = Ring::new();
-                    let rect = alloc(ui, w, 170.0);
-                    graph::graph(ui, rect, &[Series { data: disk_a.get(n).unwrap_or(&empty), color: C_DISK(), label: if long_range > 0 { "Busiest disk" } else { "Active time" } }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
-                    ui.add_space(8.0);
-                    let rect = alloc(ui, w, 150.0);
-                    graph::graph(ui, rect, &[Series { data: disk_r.get(n).unwrap_or(&empty), color: C_DISK(), label: "Read" }, Series { data: disk_w.get(n).unwrap_or(&empty), color: CYAN(), label: "Write" }], &Opts { max: None, fmt: &|v| fmt::rate(v as f64), offset, grid: true, rounded: true, interval });
+                    let rect = alloc(ui, w, tall(170.0, 2.0));
+                    let pf = |v: f32| format!("{v:.0}%");
+                    let act = disk_a.get(n).unwrap_or(&empty);
+                    self.pgraph(ui, rect, &[Series { data: act, color: C_DISK(), label: if long_range > 0 { "Busiest disk" } else { "Active time" } }], &Opts { max: Some(100.0), fmt: &pf, offset, grid: true, rounded: true, interval }, &gx, false);
+                    graph::range_stats(ui, act, &pf, gx.end, interval, C_DISK());
+                    ui.add_space(6.0);
+                    let rect = alloc(ui, w, tall(150.0, 2.0));
+                    self.pgraph(ui, rect, &[Series { data: disk_r.get(n).unwrap_or(&empty), color: C_DISK(), label: "Read" }, Series { data: disk_w.get(n).unwrap_or(&empty), color: CYAN(), label: "Write" }], &Opts { max: None, fmt: &|v| fmt::rate(v as f64), offset, grid: true, rounded: true, interval }, &gx, false);
+                    if expanded {
+                        return;
+                    }
                     ui.add_space(10.0);
                     let mut items: Vec<(&str, String)> = vec![
                         ("Active time", format!("{:.0}%", d.active)),
@@ -451,8 +486,14 @@ impl App {
                     let a = snap.adapters.iter().find(|a| &a.alias == n).cloned().unwrap_or_default();
                     big_title(ui, &a.alias, &a.description, &format!("↓ {}   ↑ {}", fmt::bits(a.recv_rate), fmt::bits(a.send_rate)), C_NET());
                     let empty = Ring::new();
-                    let rect = alloc(ui, w, 220.0);
-                    graph::graph(ui, rect, &[Series { data: ad_r.get(n).unwrap_or(&empty), color: C_NET(), label: "Receive" }, Series { data: ad_s.get(n).unwrap_or(&empty), color: CYAN(), label: "Send" }], &Opts { max: None, fmt: &|v| fmt::bits(v as f64), offset, grid: true, rounded: true, interval });
+                    let rect = alloc(ui, w, tall(220.0, 1.0));
+                    let pf = |v: f32| fmt::bits(v as f64);
+                    let rx = ad_r.get(n).unwrap_or(&empty);
+                    self.pgraph(ui, rect, &[Series { data: rx, color: C_NET(), label: "Receive" }, Series { data: ad_s.get(n).unwrap_or(&empty), color: CYAN(), label: "Send" }], &Opts { max: None, fmt: &pf, offset, grid: true, rounded: true, interval }, &gx, false);
+                    graph::range_stats(ui, rx, &pf, gx.end, interval, C_NET());
+                    if expanded {
+                        return;
+                    }
                     ui.add_space(10.0);
                     stats(ui, &[
                         ("Receive", fmt::bits(a.recv_rate)),
@@ -529,18 +570,27 @@ impl App {
                 Res::Gpu => {
                     let (name, total) = gpu_info();
                     big_title(ui, "GPU", name, &fmt::pct(snap.gpu.util), C_GPU());
-                    let rect = alloc(ui, w, 200.0);
-                    graph::graph(ui, rect, &[Series { data: &gpu, color: C_GPU(), label: "Utilization" }], &Opts { max: Some(100.0), fmt: &|v| format!("{v:.0}%"), offset, grid: true, rounded: true, interval });
-                    ui.add_space(8.0);
+                    let has_second = (long_range > 0 && gpu_temp.iter().any(|v| *v > 0.0)) || (*total > 0 && long_range == 0);
+                    let n_g = if has_second { 2.0 } else { 1.0 };
+                    let rect = alloc(ui, w, tall(200.0, n_g));
+                    let pf = |v: f32| format!("{v:.0}%");
+                    self.pgraph(ui, rect, &[Series { data: &gpu, color: C_GPU(), label: "Utilization" }], &Opts { max: Some(100.0), fmt: &pf, offset, grid: true, rounded: true, interval }, &gx, false);
+                    graph::range_stats(ui, &gpu, &pf, gx.end, interval, C_GPU());
+                    ui.add_space(6.0);
                     if long_range > 0 && gpu_temp.iter().any(|v| *v > 0.0) {
-                        let rect = alloc(ui, w, 110.0);
-                        graph::graph(ui, rect, &[Series { data: &gpu_temp, color: ORANGE(), label: "Temperature" }], &Opts { max: None, fmt: &|v| format!("{v:.0} °C"), offset, grid: true, rounded: true, interval });
+                        let rect = alloc(ui, w, tall(110.0, n_g));
+                        let tf = |v: f32| format!("{v:.0} °C");
+                        self.pgraph(ui, rect, &[Series { data: &gpu_temp, color: ORANGE(), label: "Temperature" }], &Opts { max: None, fmt: &tf, offset, grid: true, rounded: true, interval }, &gx, false);
+                        graph::range_stats(ui, &gpu_temp, &tf, gx.end, interval, ORANGE());
                         ui.add_space(8.0);
                     } else if *total > 0 && long_range == 0 {
-                        let rect = alloc(ui, w, 110.0);
+                        let rect = alloc(ui, w, tall(110.0, n_g));
                         let t = *total as f32;
-                        graph::graph(ui, rect, &[Series { data: &gpu_mem, color: PINK(), label: "Dedicated memory" }], &Opts { max: Some(t), fmt: &|v| fmt::bytes(v as u64), offset, grid: true, rounded: true, interval });
+                        self.pgraph(ui, rect, &[Series { data: &gpu_mem, color: PINK(), label: "Dedicated memory" }], &Opts { max: Some(t), fmt: &|v| fmt::bytes(v as u64), offset, grid: true, rounded: true, interval }, &gx, false);
                         ui.add_space(8.0);
+                    }
+                    if expanded {
+                        return;
                     }
                     let mut s: Vec<(String, String)> = vec![
                         ("Utilization".into(), fmt::pct(snap.gpu.util)),
@@ -659,5 +709,178 @@ fn stats_w<K: AsRef<str>>(ui: &mut Ui, items: &[(K, String)], min_w: f32) {
             }
         });
         ui.add_space(4.0);
+    }
+}
+
+
+/// Hidden in plain sight: f64 "now" for smooth time axes.
+fn now_f() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// Where the Performance graphs end and whether they are long-range (zoomable) ones.
+pub struct Gx {
+    pub end: f64,
+    pub long: bool,
+}
+
+/// Long-range Performance series: `HIST` buckets of averages over a time window.
+#[derive(Default)]
+pub struct LongSeries {
+    pub cpu: VecDeque<f32>,
+    pub mem: VecDeque<f32>,
+    pub gpu: VecDeque<f32>,
+    pub gpu_temp: VecDeque<f32>,
+    pub disk_a: VecDeque<f32>,
+    pub disk_r: VecDeque<f32>,
+    pub disk_w: VecDeque<f32>,
+    pub up: VecDeque<f32>,
+    pub down: VecDeque<f32>,
+    /// Bucket width in seconds.
+    pub bw: f32,
+    /// First recorded point in the source (0 = none).
+    pub first_t: i64,
+}
+
+impl LongSeries {
+    pub fn build(sh: &crate::sampler::Shared, start: f64, end: f64) -> Self {
+        let n = crate::sampler::HIST;
+        let bw = ((end - start) / n as f64).max(1.0);
+        // The 10-second points cover the last 24 h; older windows use the 5-minute ones, topped up
+        // with the 10-second points newer than the last 5-minute one.
+        let recent = start >= (crate::win::now_unix() - 86400 - 60) as f64;
+        let first_t = if recent { sh.long.front() } else { sh.week.front().or(sh.long.front()) }.map(|p| p.t).unwrap_or(0);
+        let mut sums = vec![[(0.0f32, 0u32); 9]; n];
+        let week_end = if recent { i64::MIN } else { sh.week.back().map(|p| p.t).unwrap_or(i64::MIN) };
+        let week_part = if recent { None } else { Some(sh.week.iter().skip(sh.week.partition_point(|p| (p.t as f64) < start))) };
+        let long_part = sh.long.iter().skip(sh.long.partition_point(|p| (p.t as f64) < start)).filter(move |p| p.t > week_end);
+        for p in week_part.into_iter().flatten().chain(long_part) {
+            let t = p.t as f64;
+            if t > end + bw {
+                break;
+            }
+            let i = ((t - start) / bw) as usize;
+            if i >= n {
+                continue;
+            }
+            for (k, v) in [p.cpu, p.mem, p.gpu, p.gpu_temp, p.disk_active, p.disk_r, p.disk_w, p.up, p.down].into_iter().enumerate() {
+                if v.is_finite() {
+                    sums[i][k].0 += v;
+                    sums[i][k].1 += 1;
+                }
+            }
+        }
+        let col = |k: usize| -> VecDeque<f32> { sums.iter().map(|b| if b[k].1 > 0 { b[k].0 / b[k].1 as f32 } else { f32::NAN }).collect() };
+        LongSeries { cpu: col(0), mem: col(1), gpu: col(2), gpu_temp: col(3), disk_a: col(4), disk_r: col(5), disk_w: col(6), up: col(7), down: col(8), bw: bw as f32, first_t }
+    }
+}
+
+impl App {
+    /// A Performance graph: linked crosshair, and on long ranges drag-to-zoom, Ctrl+wheel zoom,
+    /// double-click reset and click-for-top-apps.
+    fn pgraph(&mut self, ui: &mut Ui, rect: egui::Rect, series: &[Series], o: &Opts, gx: &Gx, by_mem: bool) {
+        let out = graph::graph_ex(ui, rect, series, o, &graph::Ex { end_unix: Some(gx.end), link: Some("perf"), select: gx.long });
+        if !gx.long {
+            return;
+        }
+        let range = [0.0, 3600.0, 86400.0, 7.0 * 86400.0][self.perf_range.min(3)];
+        let now = crate::win::now_unix() as f64;
+        if let Some((a, b)) = out.selected {
+            if b - a >= 120.0 {
+                self.perf_zoom = Some((a, b));
+                self.perf_pick = None;
+            }
+        }
+        if out.reset {
+            self.perf_zoom = None;
+            self.perf_pick = None;
+        } else if let Some((t, pos)) = out.clicked {
+            self.perf_pick = Some((t, o.interval as f64, by_mem, pos, ui.ctx().cumulative_frame_nr()));
+        }
+        if let Some((dir, t)) = out.wheel {
+            let (a, b) = self.perf_zoom.unwrap_or((now - range, now));
+            let span = b - a;
+            let new = (span * if dir > 0.0 { 0.7 } else { 1.0 / 0.7 }).clamp(600.0, range);
+            if new >= range - 1.0 {
+                self.perf_zoom = None;
+            } else {
+                let f = ((t - a) / span).clamp(0.0, 1.0);
+                let mut na = t - new * f;
+                let mut nb = na + new;
+                if nb > now {
+                    nb = now;
+                    na = now - new;
+                }
+                if na < now - range {
+                    na = now - range;
+                    nb = na + new;
+                }
+                self.perf_zoom = Some((na, nb));
+            }
+        }
+    }
+
+    /// Popup after clicking a moment: the heaviest apps around then, from the per-app history.
+    pub fn perf_pick_ui(&mut self, ctx: &egui::Context) {
+        let Some((t, span, by_mem, pos, opened)) = self.perf_pick else { return };
+        let from = ((t - span / 2.0) / 60.0).floor().max(0.0) as u32;
+        let to = ((t + span / 2.0) / 60.0).floor() as u32;
+        let (rows, first) = {
+            let sh = self.shared.lock().unwrap();
+            (sh.apphist.top_between(from, to.max(from), by_mem, 6), sh.apphist.first_minute())
+        };
+        let names: Vec<(String, String)> = rows
+            .iter()
+            .map(|(exe, _, _)| {
+                let shown = self.snap.procs.iter().find(|p| p.name.eq_ignore_ascii_case(exe)).and_then(|p| self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.description.clone())).filter(|d| !d.is_empty()).unwrap_or_else(|| exe.clone());
+                (shown, exe.clone())
+            })
+            .collect();
+        let screen = ctx.content_rect();
+        let at = egui::pos2((pos.x + 14.0).min(screen.right() - 330.0), (pos.y + 14.0).min(screen.bottom() - 300.0));
+        let mut close = false;
+        let r = egui::Area::new(egui::Id::unique("perf-pick")).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
+            egui::Frame::new().fill(CARD_HI()).stroke(Stroke::new(1.0, BORDER())).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::same(12)).shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(120) }).show(ui, |ui| {
+                ui.set_width(300.0);
+                ui.horizontal(|ui| {
+                    let label = if span >= 120.0 { format!("{} – {}", graph::time_label(t - span / 2.0, 60.0), graph::time_label(t + span / 2.0, 60.0)) } else { graph::time_label(t, 60.0) };
+                    ui.label(RichText::new(label).font(bold(13.5)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Label::new(RichText::new(I::X).color(FAINT())).sense(Sense::click())).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.label(RichText::new(if by_mem { "Top apps by memory" } else { "Top apps by CPU" }).size(11.5).color(FAINT()));
+                ui.add_space(4.0);
+                if rows.is_empty() {
+                    let msg = match first {
+                        Some(m) if (m as f64) * 60.0 > t => format!("Per-app history starts at {}.", graph::time_label(m as f64 * 60.0, 60.0)),
+                        _ => "Nothing was using much then.".to_string(),
+                    };
+                    ui.label(RichText::new(msg).size(12.0).color(MUTED()));
+                }
+                let maxv = rows.first().map(|r| if by_mem { r.2 as f32 } else { r.1 }).unwrap_or(1.0).max(0.01);
+                for ((_, cpu, mb), (shown, exe)) in rows.iter().zip(names.iter()) {
+                    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+                    let p = ui.painter();
+                    p.text(rect.left_top() + vec2(0.0, 2.0), egui::Align2::LEFT_TOP, shown, egui::FontId::proportional(12.5), TEXT());
+                    let v = if by_mem { fmt::bytes((*mb as u64) << 20) } else { fmt::pct(*cpu) };
+                    p.text(rect.right_top() + vec2(0.0, 2.0), egui::Align2::RIGHT_TOP, v, bold(12.5), if by_mem { C_MEM() } else { C_CPU() });
+                    let frac = (if by_mem { *mb as f32 } else { *cpu }) / maxv;
+                    let bar = egui::Rect::from_min_size(rect.left_top() + vec2(0.0, 20.0), vec2(rect.width(), 3.0));
+                    p.rect_filled(bar, CornerRadius::same(2), FIELD());
+                    p.rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac.clamp(0.0, 1.0), 3.0)), CornerRadius::same(2), if by_mem { C_MEM() } else { C_CPU() });
+                    resp.on_hover_text(format!("{exe}  ·  {}  ·  {}", fmt::pct(*cpu), fmt::bytes((*mb as u64) << 20)));
+                }
+                ui.add_space(2.0);
+                ui.label(RichText::new("Per-app history is kept for 24 hours.").size(10.5).color(FAINT()));
+            });
+        });
+        let frame = ctx.cumulative_frame_nr();
+        let clicked_outside = frame > opened + 1 && ctx.input(|i| i.pointer.any_pressed()) && ctx.pointer_interact_pos().is_some_and(|p| !r.response.rect.contains(p));
+        if close || clicked_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) || self.page != crate::app::Page::Performance {
+            self.perf_pick = None;
+        }
     }
 }

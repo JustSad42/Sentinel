@@ -164,6 +164,110 @@ pub fn is_dev_build() -> bool {
     p.contains("\\target\\") || crate::config::test_mode()
 }
 
+/// Seconds since this user's desktop (first explorer.exe) started, if it's running.
+pub fn secs_since_sign_in() -> Option<f64> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let snap = Handle(snap);
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut earliest: Option<i64> = None;
+        let mut ok = Process32FirstW(snap.0, &mut e);
+        while ok != 0 {
+            let len = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
+            if String::from_utf16_lossy(&e.szExeFile[..len]).eq_ignore_ascii_case("explorer.exe") {
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, e.th32ProcessID);
+                if !h.is_null() {
+                    let h = Handle(h);
+                    if let Some(t) = win::process_create_time(h.0) {
+                        earliest = Some(earliest.map_or(t, |x: i64| x.min(t)));
+                    }
+                }
+            }
+            ok = Process32NextW(snap.0, &mut e);
+        }
+        let mut now = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime(&mut now);
+        let now = ((now.dwHighDateTime as i64) << 32) | now.dwLowDateTime as i64;
+        earliest.map(|t| (now - t) as f64 / 1e7)
+    }
+}
+
+/// Milliseconds since the last keyboard or mouse input in this session.
+pub fn idle_ms() -> u64 {
+    unsafe {
+        let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+        if GetLastInputInfo(&mut li) == 0 {
+            return u64::MAX;
+        }
+        windows_sys::Win32::System::SystemInformation::GetTickCount().wrapping_sub(li.dwTime) as u64
+    }
+}
+
+/// True for a launch nobody asked for: in the first two minutes after sign-in, with no key press or
+/// click just before it. Windows' app restore (or Task Manager being reopened through the
+/// "Replace Task Manager" redirect) does this; Sentinel then stays hidden instead of popping up.
+pub fn sign_in_launch() -> bool {
+    secs_since_sign_in().is_none_or(|s| s < 120.0) && idle_ms() > 1500
+}
+
+/// Appends one line to launch.log (kept short) so unexpected launches can be traced.
+pub fn log_launch(line: &str) {
+    let p = crate::config::data_dir().join("launch.log");
+    let mut lines: Vec<String> = std::fs::read_to_string(&p).map(|s| s.lines().map(String::from).collect()).unwrap_or_default();
+    let (y, mo, d, h, mi, s) = crate::fmt::civil(win::now_unix());
+    lines.push(format!("{y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}  {line}"));
+    let skip = lines.len().saturating_sub(200);
+    let _ = std::fs::write(&p, lines[skip..].join("\n") + "\n");
+}
+
+// ---------------------------------------------------------------- "What's using this?" in Explorer
+
+const MENU_KEYS: [&str; 2] = [r"Software\Classes\*\shell\SentinelLocks", r"Software\Classes\Directory\shell\SentinelLocks"];
+
+/// Adds (or removes) "What's using this? (Sentinel)" to the right-click menu of files and folders.
+/// Per-user (HKCU), so no admin rights. On Windows 11 it sits under "Show more options".
+pub fn set_explorer_menu(enable: bool) -> Result<(), String> {
+    let hk = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    for k in MENU_KEYS {
+        if enable {
+            let (key, _) = hk.create_subkey(k).map_err(|e| e.to_string())?;
+            key.set_value("MUIVerb", &"What's using this? (Sentinel)").map_err(|e| e.to_string())?;
+            key.set_value("Icon", &format!("\"{}\",0", exe_path())).map_err(|e| e.to_string())?;
+            let (cmd, _) = key.create_subkey("command").map_err(|e| e.to_string())?;
+            cmd.set_value("", &format!("\"{}\" --locks \"%1\"", exe_path())).map_err(|e| e.to_string())?;
+        } else {
+            let _ = hk.delete_subkey_all(k);
+        }
+    }
+    Ok(())
+}
+
+pub fn explorer_menu_enabled() -> bool {
+    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER).open_subkey(format!("{}\\command", MENU_KEYS[0])).is_ok()
+}
+
+fn locks_request_path() -> std::path::PathBuf {
+    crate::config::data_dir().join("locks-request")
+}
+
+/// `--locks <path>`: leave the path for the running (elevated) copy to pick up when it shows.
+pub fn request_locks(path: &str) {
+    let _ = std::fs::write(locks_request_path(), path.as_bytes());
+}
+
+pub fn take_locks_request() -> Option<String> {
+    let p = locks_request_path();
+    let fresh = std::fs::metadata(&p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d.as_secs() < 30);
+    let s = std::fs::read_to_string(&p).ok();
+    let _ = std::fs::remove_file(&p);
+    s.filter(|s| fresh && !s.trim().is_empty())
+}
+
 fn show_flag_path() -> std::path::PathBuf {
     crate::config::data_dir().join("show-on-start")
 }

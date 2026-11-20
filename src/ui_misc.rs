@@ -580,7 +580,15 @@ impl App {
     // ------------------------------------------------------------ Rules
 
     pub fn rules_page(&mut self, ui: &mut Ui) {
+        if self.rules_tab == 1 {
+            self.schedules_page(ui);
+            return;
+        }
         header(ui, "Rules", "Automatic actions applied to matching processes, even while Sentinel is hidden", |ui| {
+            let mut t = self.rules_tab;
+            if segmented(ui, &mut t, &["When an app runs", "Scheduled"]) {
+                self.rules_tab = t;
+            }
             if button(ui, Btn::Primary, I::PLUS, "New rule", true).clicked() {
                 let id = self.cfg.next_rule_id;
                 self.cfg.next_rule_id += 1;
@@ -693,6 +701,150 @@ impl App {
         }
     }
 
+    fn new_schedule(&mut self, when: crate::config::When, action: crate::config::SchedAction, target: &str) {
+        let id = self.cfg.next_schedule_id.max(1);
+        self.cfg.next_schedule_id = id + 1;
+        self.cfg.schedules.push(crate::config::Schedule { id, enabled: true, when, action, target: target.to_string() });
+        self.sync_rules();
+    }
+
+    fn schedules_page(&mut self, ui: &mut Ui) {
+        use crate::config::{SchedAction, When};
+        header(ui, "Rules", "Timed actions. They run while Sentinel is hidden, as long as the PC is on.", |ui| {
+            let mut t = self.rules_tab;
+            if segmented(ui, &mut t, &["When an app runs", "Scheduled"]) {
+                self.rules_tab = t;
+            }
+            if button(ui, Btn::Primary, I::PLUS, "New scheduled action", true).clicked() {
+                self.new_schedule(When::Daily { hour: 4, minute: 0 }, SchedAction::Restart, "");
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Templates").color(FAINT()));
+            let templates: [(&str, When, SchedAction, &str); 4] = [
+                ("Restart Explorer every night at 4:00", When::Daily { hour: 4, minute: 0 }, SchedAction::RestartExplorer, ""),
+                ("Free standby memory every 6 hours", When::Every { hours: 6 }, SchedAction::ClearStandby, ""),
+                ("End OneDrive while on battery", When::OnBattery, SchedAction::End, "OneDrive.exe"),
+                ("Restart an app every morning", When::Daily { hour: 7, minute: 0 }, SchedAction::Restart, ""),
+            ];
+            for (label, w, a, t) in templates {
+                let mut off = false;
+                if chip(ui, &mut off, label, None).clicked() {
+                    self.new_schedule(w, a, t);
+                }
+            }
+        });
+        ui.add_space(10.0);
+        if self.cfg.schedules.is_empty() {
+            empty_state(ui, I::CLOCK, "No scheduled actions", "Restart an app every night, end something while on battery, or free standby memory every few hours.");
+            return;
+        }
+        let snap = self.snap.clone();
+        let last = self.shared.lock().unwrap().sched_last.clone();
+        let mut changed = false;
+        let mut delete = None;
+        let mut run_now = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (si, s) in self.cfg.schedules.iter_mut().enumerate() {
+                card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        changed |= toggle_widget(ui, &mut s.enabled).changed();
+                        // When
+                        let kinds = ["Every day at", "Every", "While on battery"];
+                        let cur = kinds.iter().position(|k| *k == s.when.label()).unwrap_or(0);
+                        let mut sel = cur;
+                        egui::ComboBox::from_id_salt(("sch-when", s.id)).selected_text(kinds[cur]).width(140.0).show_ui(ui, |ui| {
+                            for (i, k) in kinds.iter().enumerate() {
+                                ui.selectable_value(&mut sel, i, *k);
+                            }
+                        });
+                        if sel != cur {
+                            s.when = match sel {
+                                0 => When::Daily { hour: 4, minute: 0 },
+                                1 => When::Every { hours: 6 },
+                                _ => When::OnBattery,
+                            };
+                            changed = true;
+                        }
+                        match &mut s.when {
+                            When::Daily { hour, minute } => {
+                                changed |= ui.add(egui::DragValue::new(hour).range(0..=23).custom_formatter(|v, _| format!("{:02}", v as u32))).changed();
+                                ui.label(RichText::new(":").color(MUTED()));
+                                changed |= ui.add(egui::DragValue::new(minute).range(0..=59).custom_formatter(|v, _| format!("{:02}", v as u32))).changed();
+                            }
+                            When::Every { hours } => {
+                                changed |= ui.add(egui::DragValue::new(hours).range(1..=168).suffix(" h")).changed();
+                            }
+                            When::OnBattery => {}
+                        }
+                        ui.label(RichText::new("do").color(MUTED()));
+                        let cur = SchedAction::ALL.iter().position(|a| *a == s.action).unwrap_or(0);
+                        let mut sel = cur;
+                        egui::ComboBox::from_id_salt(("sch-act", s.id)).selected_text(s.action.label()).width(170.0).show_ui(ui, |ui| {
+                            for (i, a) in SchedAction::ALL.iter().enumerate() {
+                                ui.selectable_value(&mut sel, i, a.label());
+                            }
+                        });
+                        if sel != cur {
+                            s.action = SchedAction::ALL[sel];
+                            changed = true;
+                        }
+                        if s.action.needs_target() {
+                            let hint = if s.action == SchedAction::Start { "program path, e.g. C:\\Tools\\app.exe" } else { "process name, e.g. Discord.exe" };
+                            let resp = field(ui, egui::Id::unique(("sch-target", s.id)), if s.action == SchedAction::Start { I::FOLDER_OPEN } else { I::MAGNIFYING_GLASS }, &mut s.target, hint, 230.0);
+                            changed |= resp.changed();
+                            if s.action == SchedAction::Start && icon_button(ui, I::FOLDER_OPEN, "Browse…", false).clicked() {
+                                if let Some(p) = rfd::FileDialog::new().add_filter("Programs", &["exe"]).pick_file() {
+                                    s.target = p.to_string_lossy().to_string();
+                                    changed = true;
+                                }
+                            }
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, I::TRASH, "Delete", false).clicked() {
+                                delete = Some(si);
+                            }
+                            if icon_button(ui, I::PLAY, "Run now", false).clicked() {
+                                run_now = Some(s.id);
+                            }
+                        });
+                    });
+                    let pat = s.target.trim();
+                    let status = if s.action.needs_target() && pat.is_empty() {
+                        if s.action == SchedAction::Start { "Pick a program to start.".to_string() } else { "Type a process name to activate this.".to_string() }
+                    } else if s.action.needs_target() && s.action != SchedAction::Start && crate::sampler::critical(pat) {
+                        "Critical Windows processes are never touched.".to_string()
+                    } else {
+                        let running = if s.action == SchedAction::Start || !s.action.needs_target() { String::new() } else {
+                            let n = snap.procs.iter().filter(|p| glob_match(pat, &p.name)).count();
+                            format!("  ·  matches {n} running process{}", if n == 1 { "" } else { "es" })
+                        };
+                        let when = match last.get(&s.id) {
+                            Some(t) => format!("Last run {}", fmt::ago(*t)),
+                            None => "Hasn't run yet".to_string(),
+                        };
+                        format!("{when}{running}")
+                    };
+                    ui.label(RichText::new(status).size(12.0).color(FAINT()));
+                });
+                ui.add_space(8.0);
+            }
+        });
+        if let Some(i) = delete {
+            self.cfg.schedules.remove(i);
+            changed = true;
+        }
+        if let Some(id) = run_now {
+            self.shared.lock().unwrap().sched_run_now.push(id);
+            self.ctl.refresh();
+            self.toast(ToastKind::Info, "Running it now. The result shows in History › Activity.");
+        }
+        if changed {
+            self.sync_rules();
+        }
+    }
+
     // ------------------------------------------------------------ Settings
 
     pub fn settings_page(&mut self, ui: &mut Ui) {
@@ -730,6 +882,27 @@ impl App {
                             });
                             let _ = tx.send(Msg::IfeoState(admin::ifeo_enabled(), admin::logon_task_enabled()));
                         });
+                    }
+                });
+            });
+            ui.add_space(14.0);
+            section(ui, I::LOCK_KEY, "Explorer");
+            card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let dev = integration::is_dev_build();
+                let mut on = self.cfg.explorer_menu;
+                setting_row(ui, "\"What's using this?\" in the right-click menu", "Right-click a file or folder that won't delete or move to see which apps have it open, and end them. On Windows 11 it's under Show more options.", |ui| {
+                    let r = ui.add_enabled_ui(!dev, |ui| toggle_widget(ui, &mut on)).inner;
+                    if dev {
+                        r.on_hover_text("Only available in the installed copy");
+                    } else if r.changed() {
+                        match integration::set_explorer_menu(on) {
+                            Ok(()) => {
+                                self.cfg.explorer_menu = on;
+                                self.cfg.save();
+                            }
+                            Err(e) => self.toast(ToastKind::Bad, format!("Couldn't change the menu: {e}")),
+                        }
                     }
                 });
             });
@@ -817,6 +990,24 @@ impl App {
                     }
                 });
                 ui.separator();
+                setting_row(ui, "Sidebar meters", "The usage bars under the sidebar menu. You can also right-click them.", |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        for it in crate::config::OverlayItem::ALL.iter().rev() {
+                            let mut on = self.cfg.sidebar_meters.contains(it);
+                            if chip(ui, &mut on, it.label(), None).clicked() {
+                                if on {
+                                    self.cfg.sidebar_meters.push(*it);
+                                    let order = crate::config::OverlayItem::ALL;
+                                    self.cfg.sidebar_meters.sort_by_key(|x| order.iter().position(|o| o == x));
+                                } else {
+                                    self.cfg.sidebar_meters.retain(|x| x != it);
+                                }
+                                self.cfg.save();
+                            }
+                        }
+                    });
+                });
+                ui.separator();
                 let mut v = self.cfg.overlay;
                 setting_row(ui, "Mini overlay", "A small always-on-top readout of CPU, memory, GPU and network in a screen corner, even while Sentinel is hidden. Click it to open Sentinel.", |ui| {
                     if toggle_widget(ui, &mut v).changed() {
@@ -830,6 +1021,42 @@ impl App {
                         let mut i = self.cfg.overlay_corner.min(3);
                         if segmented(ui, &mut i, &["Top right", "Top left", "Bottom right", "Bottom left"]) {
                             self.cfg.overlay_corner = i;
+                            self.cfg.save();
+                        }
+                    });
+                    ui.separator();
+                    setting_row(ui, "Overlay shows", "Pick up to 6. Ping uses the first internet target on Network › Latency.", |ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            for it in crate::config::OverlayItem::ALL.iter().rev() {
+                                let mut on = self.cfg.overlay_items.contains(it);
+                                let full = self.cfg.overlay_items.len() >= 6 && !on;
+                                let r = ui.add_enabled_ui(!full, |ui| chip(ui, &mut on, it.label(), None)).inner;
+                                if r.clicked() {
+                                    if on {
+                                        self.cfg.overlay_items.push(*it);
+                                        let order = crate::config::OverlayItem::ALL;
+                                        self.cfg.overlay_items.sort_by_key(|x| order.iter().position(|o| o == x));
+                                    } else if self.cfg.overlay_items.len() > 1 {
+                                        self.cfg.overlay_items.retain(|x| x != it);
+                                    }
+                                    self.cfg.save();
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    setting_row(ui, "Overlay opacity", "Lower it so the overlay doesn't cover what's behind.", |ui| {
+                        let mut v = (self.cfg.overlay_opacity * 100.0).round() as u32;
+                        if ui.add(egui::Slider::new(&mut v, 30..=100).suffix("%")).changed() {
+                            self.cfg.overlay_opacity = v as f32 / 100.0;
+                            self.cfg.save();
+                        }
+                    });
+                    ui.separator();
+                    let mut v = self.cfg.overlay_click_through;
+                    setting_row(ui, "Click-through", "Mouse clicks pass through the overlay to the game or app underneath. Open Sentinel with Ctrl+Shift+Esc instead of clicking it.", |ui| {
+                        if toggle_widget(ui, &mut v).changed() {
+                            self.cfg.overlay_click_through = v;
                             self.cfg.save();
                         }
                     });
@@ -1071,7 +1298,7 @@ impl App {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if (button(ui, Btn::Primary, I::PLAY, "Run", !cmd.trim().is_empty()).clicked() || go) && !cmd.trim().is_empty() {
                                 let (exe, args) = crate::actions::split_args(cmd.trim());
-                                match win::shell_open(&exe, &args, if *admin { "runas" } else { "" }) {
+                                match if *admin { win::shell_open(&exe, &args, "runas") } else { win::launch_as_user(&exe, &args, None) } {
                                     Ok(()) => {
                                         self.toast(ToastKind::Good, format!("Started {exe}"));
                                         keep = false;

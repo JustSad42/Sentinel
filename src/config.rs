@@ -177,6 +177,103 @@ pub struct Config {
     #[serde(default)]
     pub layout_version: u32,
     pub startup_sort: (usize, bool),
+    /// What the mini overlay shows, in order.
+    pub overlay_items: Vec<OverlayItem>,
+    /// 0.3 – 1.0
+    pub overlay_opacity: f32,
+    /// Clicks go through the overlay to whatever is underneath (for games).
+    pub overlay_click_through: bool,
+    pub schedules: Vec<Schedule>,
+    pub next_schedule_id: u64,
+    /// "What's using this? (Sentinel)" in Explorer's right-click menu.
+    pub explorer_menu: bool,
+    /// Usage bars at the bottom of the sidebar, top to bottom.
+    pub sidebar_meters: Vec<OverlayItem>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub enum OverlayItem {
+    Cpu,
+    CpuClock,
+    Memory,
+    Gpu,
+    GpuTemp,
+    Vram,
+    Disk,
+    Down,
+    Up,
+    Ping,
+}
+
+impl OverlayItem {
+    pub const ALL: [OverlayItem; 10] = [Self::Cpu, Self::CpuClock, Self::Memory, Self::Gpu, Self::GpuTemp, Self::Vram, Self::Disk, Self::Down, Self::Up, Self::Ping];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::CpuClock => "CPU clock",
+            Self::Memory => "Memory",
+            Self::Gpu => "GPU",
+            Self::GpuTemp => "GPU temp",
+            Self::Vram => "VRAM",
+            Self::Disk => "Disk",
+            Self::Down => "Download",
+            Self::Up => "Upload",
+            Self::Ping => "Ping",
+        }
+    }
+}
+
+/// A timed action (Rules page › Scheduled).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Schedule {
+    pub id: u64,
+    pub enabled: bool,
+    pub when: When,
+    pub action: SchedAction,
+    /// Process name pattern (End / Restart) or program path (Start).
+    pub target: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Debug)]
+pub enum When {
+    Daily { hour: u8, minute: u8 },
+    Every { hours: u32 },
+    OnBattery,
+}
+
+impl When {
+    pub fn label(&self) -> &'static str {
+        match self {
+            When::Daily { .. } => "Every day at",
+            When::Every { .. } => "Every",
+            When::OnBattery => "While on battery",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub enum SchedAction {
+    End,
+    Restart,
+    Start,
+    RestartExplorer,
+    ClearStandby,
+}
+
+impl SchedAction {
+    pub const ALL: [SchedAction; 5] = [Self::End, Self::Restart, Self::Start, Self::RestartExplorer, Self::ClearStandby];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::End => "End app",
+            Self::Restart => "Restart app",
+            Self::Start => "Start program",
+            Self::RestartExplorer => "Restart Explorer",
+            Self::ClearStandby => "Free standby memory",
+        }
+    }
+    pub fn needs_target(self) -> bool {
+        matches!(self, Self::End | Self::Restart | Self::Start)
+    }
 }
 
 impl Default for Config {
@@ -214,6 +311,13 @@ impl Default for Config {
             last_selected: None,
             layout_version: 2,
             startup_sort: (0, false),
+            overlay_items: vec![OverlayItem::Cpu, OverlayItem::Memory, OverlayItem::Gpu, OverlayItem::GpuTemp, OverlayItem::Down],
+            overlay_opacity: 1.0,
+            overlay_click_through: false,
+            schedules: Vec::new(),
+            next_schedule_id: 1,
+            explorer_menu: false,
+            sidebar_meters: vec![OverlayItem::Cpu, OverlayItem::Memory, OverlayItem::Gpu],
         }
     }
 }

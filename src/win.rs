@@ -491,3 +491,73 @@ pub fn filetime_to_unix(ft: i64) -> i64 {
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
+
+/// Starts a program with the signed-in user's normal (non-admin) rights, even though Sentinel itself
+/// runs elevated: the new process is parented to Explorer and inherits its token. Falls back to a
+/// plain ShellExecute when that isn't possible (e.g. URLs, or Explorer isn't running).
+pub fn launch_as_user(exe: &str, args: &str, cwd: Option<&str>) -> Result<(), String> {
+    let looks_like_program = !exe.contains("://") && (exe.to_ascii_lowercase().ends_with(".exe") || !exe.contains('.'));
+    if !is_elevated() || !looks_like_program {
+        return shell_open(exe, args, "");
+    }
+    unsafe {
+        let shell = GetShellWindow();
+        let mut pid = 0u32;
+        if shell.is_null() || GetWindowThreadProcessId(shell, &mut pid) == 0 || pid == 0 {
+            return shell_open(exe, args, "");
+        }
+        let hp = OpenProcess(PROCESS_CREATE_PROCESS, 0, pid);
+        if hp.is_null() {
+            return shell_open(exe, args, "");
+        }
+        let hp = Handle(hp);
+        let mut size = 0usize;
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+        let mut buf = vec![0u8; size.max(64)];
+        let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        if InitializeProcThreadAttributeList(list, 1, 0, &mut size) == 0 {
+            return shell_open(exe, args, "");
+        }
+        let mut parent = hp.0;
+        let ok = UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize, &mut parent as *mut HANDLE as *const c_void, std::mem::size_of::<HANDLE>(), std::ptr::null_mut(), std::ptr::null());
+        if ok == 0 {
+            DeleteProcThreadAttributeList(list);
+            return shell_open(exe, args, "");
+        }
+        let mut si: STARTUPINFOEXW = std::mem::zeroed();
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.lpAttributeList = list;
+        let quoted = if exe.starts_with('"') { exe.to_string() } else { format!("\"{exe}\"") };
+        let mut cmd = wide(&if args.is_empty() { quoted } else { format!("{quoted} {args}") });
+        let dir = cwd.map(wide).or_else(|| Path::new(exe).parent().filter(|p| p.is_dir()).map(|p| wide(&p.to_string_lossy())));
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let ok = CreateProcessW(
+            std::ptr::null(),
+            cmd.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP,
+            std::ptr::null(),
+            dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
+            &si.StartupInfo,
+            &mut pi,
+        );
+        DeleteProcThreadAttributeList(list);
+        if ok == 0 {
+            let e = last_error();
+            return shell_open(exe, args, "").map_err(|_| format!("Could not start it (error {e})"));
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        Ok(())
+    }
+}
+
+/// Hands memory pages Sentinel isn't actively using back to Windows (they come back on demand).
+/// Most of the startup working set (driver and font setup) is never touched again.
+pub fn trim_working_set() {
+    unsafe {
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}

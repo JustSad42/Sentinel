@@ -179,6 +179,8 @@ pub struct LongPoint {
 
 pub const LONG_SECS: i64 = 10;
 pub const LONG_KEEP: usize = 8640 + 360;
+pub const WEEK_SECS: i64 = 300;
+pub const WEEK_KEEP: usize = 2016 + 48;
 
 #[derive(Default)]
 struct LongAcc {
@@ -193,11 +195,30 @@ pub struct Shared {
     pub snap: Arc<Snapshot>,
     pub sys: SysHistory,
     pub long: VecDeque<LongPoint>,
+    /// 5-minute averages for the 7-day graphs (built from `long`).
+    pub week: VecDeque<LongPoint>,
     pub proc_hist: HashMap<Key, VecDeque<ProcPoint>>,
+    /// Per-app one-minute averages for the last 24 h.
+    pub apphist: crate::apphist::AppHist,
     pub history: Vec<HistEntry>,
     pub running_idx: HashMap<Key, usize>,
     pub log: VecDeque<LogEvent>,
     pub rules: Vec<Rule>,
+    pub schedules: Vec<crate::config::Schedule>,
+    /// Last run (unix) per schedule id; persisted in schedules-state.json.
+    pub sched_last: HashMap<u64, i64>,
+    /// "Run now" clicks waiting for the sampler.
+    pub sched_run_now: Vec<u64>,
+}
+
+impl Control {
+    /// Ask for a fresh sample now (wakes the sampler instead of it polling for this).
+    pub fn refresh(&self) {
+        self.refresh_now.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.get() {
+            t.unpark();
+        }
+    }
 }
 
 impl Shared {
@@ -210,6 +231,8 @@ impl Shared {
 }
 
 pub struct Control {
+    /// The sampler thread, so a refresh request can wake it straight away.
+    pub thread: std::sync::OnceLock<std::thread::Thread>,
     pub interval_ms: AtomicU64,
     pub visible: AtomicBool,
     pub refresh_now: AtomicBool,
@@ -374,6 +397,8 @@ pub struct Sampler {
     prev_adapters: HashMap<u32, (u64, u64, u64, u64)>,
     hw: crate::hw::Dyn,
     long_acc: LongAcc,
+    week_bucket: i64,
+    on_battery: bool,
     boot: crate::boot::Tracker,
     pdh: Option<Pdh>,
     disk_io: Option<crate::disk::Disks>,
@@ -408,6 +433,8 @@ impl Sampler {
             prev_adapters: HashMap::new(),
             hw: Default::default(),
             long_acc: LongAcc::default(),
+            week_bucket: 0,
+            on_battery: false,
             boot: Default::default(),
             pdh: None,
             disk_io: None,
@@ -427,15 +454,46 @@ impl Sampler {
             .spawn(move || {
                 s.pdh = Pdh::new();
                 s.disk_io = Some(crate::disk::Disks::new());
+                let _ = s.ctl.thread.set(std::thread::current());
+                let started = Instant::now();
+                let mut hidden_since: Option<Instant> = None;
+                let mut last_trim: Option<Instant> = None;
                 loop {
                     let t0 = Instant::now();
                     s.sample();
-                    let interval = Duration::from_millis(s.ctl.interval_ms.load(Ordering::Relaxed).clamp(250, 10_000));
-                    while t0.elapsed() < interval {
+                    // Return memory: once after startup settles, then 5 s after hiding and every
+                    // 10 minutes while hidden.
+                    let hidden = !s.ctl.visible.load(Ordering::Relaxed);
+                    if hidden {
+                        hidden_since.get_or_insert(t0);
+                    } else {
+                        hidden_since = None;
+                    }
+                    let due = match (last_trim, hidden_since) {
+                        (None, _) => started.elapsed() >= Duration::from_secs(20),
+                        (Some(l), Some(h)) => (h.elapsed() >= Duration::from_secs(5) && l < h) || l.elapsed() >= Duration::from_secs(600),
+                        _ => false,
+                    };
+                    if due {
+                        win::trim_working_set();
+                        last_trim = Some(Instant::now());
+                    }
+                    // Hidden (and no overlay): every 2 s is plenty for rules, history and schedules.
+                    let mut ms = s.ctl.interval_ms.load(Ordering::Relaxed).clamp(250, 10_000);
+                    if !s.ctl.visible.load(Ordering::Relaxed) && !s.ctl.overlay.load(Ordering::Relaxed) {
+                        ms = ms.max(2000);
+                    }
+                    let interval = Duration::from_millis(ms);
+                    // Sleep until the next tick, or until the UI asks for a refresh (unpark).
+                    loop {
                         if s.ctl.refresh_now.swap(false, Ordering::Relaxed) {
                             break;
                         }
-                        std::thread::sleep(Duration::from_millis(25));
+                        let left = interval.saturating_sub(t0.elapsed());
+                        if left.is_zero() {
+                            break;
+                        }
+                        std::thread::park_timeout(left);
                     }
                 }
             })
@@ -707,6 +765,11 @@ impl Sampler {
         // --- deeper kernel / hardware counters
         let extra = self.hw.sample(elapsed, visible || overlay || long_tick, self.tick, (tot_intr, tot_dpc, tot_irq, tot_all));
 
+        if let Some((_, ac)) = extra.battery {
+            self.on_battery = !ac;
+        }
+        self.apply_schedules(&procs);
+
         // --- boot timeline / startup impact (first minutes of the session only)
         self.boot.sample(&procs, cpu_total);
 
@@ -793,6 +856,7 @@ impl Sampler {
             h.push_back(ProcPoint { cpu: p.cpu, mem: p.mem, io: p.io_rate, net: p.net_rate() });
         }
         sh.proc_hist.retain(|k, _| seen.contains(k));
+        sh.apphist.sample(&procs, now_unix);
         // 24-hour history: 10-second averages
         {
             let now_u = now_unix;
@@ -836,6 +900,21 @@ impl Sampler {
                 }
                 sh.long.push_back(p);
                 *a = LongAcc::default();
+                // Every 5 minutes, fold the finished bucket of 10-second points into the 7-day series.
+                let b = p.t / WEEK_SECS;
+                if self.week_bucket != 0 && b != self.week_bucket {
+                    let prev = self.week_bucket;
+                    let pts: Vec<LongPoint> = sh.long.iter().rev().skip(1).take_while(|q| q.t / WEEK_SECS >= prev).filter(|q| q.t / WEEK_SECS == prev).copied().collect();
+                    if let Some(w) = average(&pts, (prev + 1) * WEEK_SECS) {
+                        if sh.week.back().is_none_or(|l| l.t < w.t) {
+                            if sh.week.len() >= WEEK_KEEP {
+                                sh.week.pop_front();
+                            }
+                            sh.week.push_back(w);
+                        }
+                    }
+                }
+                self.week_bucket = b;
             }
         }
         // system history
@@ -903,6 +982,115 @@ impl Sampler {
                 ctx.request_repaint();
             }
         }
+    }
+
+    fn apply_schedules(&mut self, procs: &[Proc]) {
+        use crate::config::{SchedAction, When};
+        let (scheds, run_now, last) = {
+            let mut sh = self.shared.lock().unwrap();
+            if sh.schedules.is_empty() {
+                return;
+            }
+            (sh.schedules.clone(), std::mem::take(&mut sh.sched_run_now), sh.sched_last.clone())
+        };
+        let now = win::now_unix();
+        let (_, _, _, h, mi, s) = crate::fmt::civil(now);
+        let midnight = now - (h as i64 * 3600 + mi as i64 * 60 + s as i64);
+        let mut logs: Vec<(LogKind, String)> = Vec::new();
+        let mut ran: Vec<(u64, i64)> = Vec::new();
+        for sc in &scheds {
+            let forced = run_now.contains(&sc.id);
+            if !sc.enabled && !forced {
+                continue;
+            }
+            let prev = last.get(&sc.id).copied();
+            let due = forced
+                || match sc.when {
+                    When::Daily { hour, minute } => {
+                        let t = midnight + hour as i64 * 3600 + minute as i64 * 60;
+                        now >= t && now < t + 600 && prev.is_none_or(|l| l < t)
+                    }
+                    When::Every { hours } => match prev {
+                        // First time we see it: start the clock rather than firing right away.
+                        None => {
+                            ran.push((sc.id, now));
+                            false
+                        }
+                        Some(l) => now - l >= hours.max(1) as i64 * 3600,
+                    },
+                    When::OnBattery => self.on_battery && prev.is_none_or(|l| now - l >= 30),
+                };
+            if !due {
+                continue;
+            }
+            ran.push((sc.id, now));
+            let quiet_if_idle = sc.when == When::OnBattery && !forced;
+            let pat = sc.target.trim();
+            let matching: Vec<&Proc> = if sc.action == SchedAction::RestartExplorer {
+                procs.iter().filter(|p| p.name.eq_ignore_ascii_case("explorer.exe")).collect()
+            } else if pat.is_empty() {
+                Vec::new()
+            } else {
+                procs.iter().filter(|p| p.pid > 4 && !critical(&p.name) && glob_match(pat, &p.name)).collect()
+            };
+            let pids: HashSet<u32> = matching.iter().map(|p| p.pid).collect();
+            let roots: Vec<&Proc> = matching.iter().copied().filter(|p| !pids.contains(&p.ppid)).collect();
+            let what = format!("Scheduled ({})", sc.action.label().to_lowercase());
+            match sc.action {
+                SchedAction::End => {
+                    if matching.is_empty() {
+                        if !quiet_if_idle {
+                            logs.push((LogKind::Rule, format!("{what}: {pat} wasn't running")));
+                        }
+                        continue;
+                    }
+                    let targets: Vec<(u32, i64)> = matching.iter().map(|p| p.key()).collect();
+                    let (ok, errs) = crate::actions::kill_many(&targets);
+                    logs.push((if errs.is_empty() { LogKind::Rule } else { LogKind::Error }, format!("{what}: ended {ok} {} process{}{}", matching[0].name, if ok == 1 { "" } else { "es" }, errs.first().map(|e| format!(" ({e})")).unwrap_or_default())));
+                }
+                SchedAction::Restart | SchedAction::RestartExplorer => {
+                    if roots.is_empty() {
+                        logs.push((LogKind::Rule, format!("{what}: {} wasn't running", if pat.is_empty() { "explorer.exe" } else { pat })));
+                        continue;
+                    }
+                    for p in roots.iter().take(4) {
+                        match crate::actions::restart(p) {
+                            Ok(()) => logs.push((LogKind::Rule, format!("{what}: restarted {}", p.name))),
+                            Err(e) => logs.push((LogKind::Error, format!("{what}: couldn't restart {}: {e}", p.name))),
+                        }
+                    }
+                }
+                SchedAction::Start => {
+                    let file = std::path::Path::new(pat.trim_matches('"')).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                    if !file.is_empty() && procs.iter().any(|p| p.name.eq_ignore_ascii_case(&file)) {
+                        if forced {
+                            logs.push((LogKind::Rule, format!("{what}: {file} is already running")));
+                        }
+                        continue;
+                    }
+                    let (exe, args) = crate::actions::split_args(pat);
+                    match win::launch_as_user(&exe, &args, None) {
+                        Ok(()) => logs.push((LogKind::Rule, format!("{what}: started {file}"))),
+                        Err(e) => logs.push((LogKind::Error, format!("{what}: couldn't start {file}: {e}"))),
+                    }
+                }
+                SchedAction::ClearStandby => match crate::hw::purge_standby() {
+                    Ok(freed) => logs.push((LogKind::Rule, format!("{what}: freed {}", crate::fmt::bytes(freed)))),
+                    Err(e) => logs.push((LogKind::Error, format!("{what}: {e}"))),
+                },
+            }
+        }
+        if ran.is_empty() && logs.is_empty() {
+            return;
+        }
+        let mut sh = self.shared.lock().unwrap();
+        for (id, t) in ran {
+            sh.sched_last.insert(id, t);
+        }
+        for (k, t) in logs {
+            sh.log(k, t);
+        }
+        save_sched_last(&sh.sched_last);
     }
 
     fn apply_rules(&mut self, procs: &[Proc], dt: f32) {
@@ -1000,20 +1188,81 @@ pub fn load_history() -> (Vec<HistEntry>, VecDeque<LogEvent>) {
     (h, log)
 }
 
-pub fn load_long() -> VecDeque<LongPoint> {
-    let cutoff = win::now_unix() - 86400 - 3600;
-    let v: Vec<LongPoint> = std::fs::read(crate::config::data_dir().join("long-history.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+pub fn load_sched_last() -> HashMap<u64, i64> {
+    std::fs::read(crate::config::data_dir().join("schedules-state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_sched_last(m: &HashMap<u64, i64>) {
+    if let Ok(b) = serde_json::to_vec(m) {
+        let _ = std::fs::write(crate::config::data_dir().join("schedules-state.json"), b);
+    }
+}
+
+/// Mean of a set of points (GPU fields ignore missing samples); None if empty.
+pub fn average(pts: &[LongPoint], t: i64) -> Option<LongPoint> {
+    if pts.is_empty() {
+        return None;
+    }
+    let n = pts.len() as f32;
+    let nan_mean = |f: &dyn Fn(&LongPoint) -> f32| {
+        let v: Vec<f32> = pts.iter().map(f).filter(|v| v.is_finite()).collect();
+        if v.is_empty() { f32::NAN } else { v.iter().sum::<f32>() / v.len() as f32 }
+    };
+    Some(LongPoint {
+        t,
+        cpu: pts.iter().map(|p| p.cpu).sum::<f32>() / n,
+        mem: pts.iter().map(|p| p.mem).sum::<f32>() / n,
+        gpu: nan_mean(&|p| p.gpu),
+        gpu_temp: nan_mean(&|p| p.gpu_temp),
+        disk_r: pts.iter().map(|p| p.disk_r).sum::<f32>() / n,
+        disk_w: pts.iter().map(|p| p.disk_w).sum::<f32>() / n,
+        disk_active: pts.iter().map(|p| p.disk_active).sum::<f32>() / n,
+        down: pts.iter().map(|p| p.down).sum::<f32>() / n,
+        up: pts.iter().map(|p| p.up).sum::<f32>() / n,
+    })
+}
+
+fn load_points(file: &str, keep_secs: i64) -> VecDeque<LongPoint> {
+    let cutoff = win::now_unix() - keep_secs - 3600;
+    let v: Vec<LongPoint> = std::fs::read(crate::config::data_dir().join(file)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     v.into_iter().filter(|p| p.t >= cutoff).map(|p| LongPoint { gpu: if p.gpu < 0.0 { f32::NAN } else { p.gpu }, gpu_temp: if p.gpu_temp < 0.0 { f32::NAN } else { p.gpu_temp }, ..p }).collect()
 }
 
-pub fn save_history(sh: &Shared, keep_days: u32) {
-    {
-        // NaN isn't valid JSON: store missing GPU samples as -1.
-        let v: Vec<LongPoint> = sh.long.iter().map(|p| LongPoint { gpu: if p.gpu.is_nan() { -1.0 } else { p.gpu }, gpu_temp: if p.gpu_temp.is_nan() { -1.0 } else { p.gpu_temp }, ..*p }).collect();
-        if let Ok(b) = serde_json::to_vec(&v) {
-            let _ = std::fs::write(crate::config::data_dir().join("long-history.json"), b);
+fn save_points(file: &str, pts: &VecDeque<LongPoint>) {
+    // NaN isn't valid JSON: store missing GPU samples as -1.
+    let v: Vec<LongPoint> = pts.iter().map(|p| LongPoint { gpu: if p.gpu.is_nan() { -1.0 } else { p.gpu }, gpu_temp: if p.gpu_temp.is_nan() { -1.0 } else { p.gpu_temp }, ..*p }).collect();
+    if let Ok(b) = serde_json::to_vec(&v) {
+        let _ = std::fs::write(crate::config::data_dir().join(file), b);
+    }
+}
+
+pub fn load_long() -> VecDeque<LongPoint> {
+    load_points("long-history.json", 86400)
+}
+
+/// 7-day series; on first run after updating, seeded from the 24-hour points so it isn't empty.
+pub fn load_week(long: &VecDeque<LongPoint>) -> VecDeque<LongPoint> {
+    let mut w = load_points("week-history.json", 7 * 86400);
+    if w.is_empty() {
+        let mut bucket: Vec<LongPoint> = Vec::new();
+        let mut cur = 0;
+        for p in long {
+            let b = p.t / WEEK_SECS;
+            if b != cur && !bucket.is_empty() {
+                w.extend(average(&bucket, (cur + 1) * WEEK_SECS));
+                bucket.clear();
+            }
+            cur = b;
+            bucket.push(*p);
         }
     }
+    w
+}
+
+pub fn save_history(sh: &Shared, keep_days: u32) {
+    sh.apphist.save();
+    save_points("long-history.json", &sh.long);
+    save_points("week-history.json", &sh.week);
     let cutoff = win::now_unix() - keep_days.max(1) as i64 * 86400;
     let mut list: Vec<&HistEntry> = sh.history.iter().filter(|e| e.ended.unwrap_or(i64::MAX) >= cutoff).collect();
     if list.len() > 30_000 {

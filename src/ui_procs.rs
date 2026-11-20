@@ -11,7 +11,6 @@ use crate::win;
 use egui::{Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Ui, vec2};
 use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Section {
@@ -205,6 +204,9 @@ impl App {
     fn matches_search(&self, p: &Proc, q: &str) -> bool {
         if q.is_empty() {
             return true;
+        }
+        if let Some(port) = port_query(q) {
+            return self.snap.conns.iter().any(|c| c.pid == p.pid && (c.local.port() == port || c.remote.is_some_and(|r| r.port() == port)));
         }
         if p.name.to_lowercase().contains(q) || p.pid.to_string() == q {
             return true;
@@ -442,6 +444,7 @@ impl App {
     }
 
     pub fn processes_page(&mut self, ui: &mut Ui) {
+        self.refresh_leaks();
         let ctx = ui.ctx().clone();
         let snap = self.snap.clone();
         let sub = format!(
@@ -516,10 +519,20 @@ impl App {
             if susp > 0 || self.only_suspended {
                 chip(ui, &mut self.only_suspended, &format!("{} Suspended", I::SNOWFLAKE), Some(susp));
             }
-            if !self.search.is_empty() {
-                ui.label(RichText::new("Showing matches as a list").size(12.0).color(FAINT()));
-            }
+            // Truncated, so a narrow window never gets pushed wider by this hint.
+            let hint = if port_query(&self.search).is_some() {
+                "Apps using this port"
+            } else if !self.search.is_empty() {
+                "Showing matches as a list"
+            } else {
+                "Tip: type :3000 to find what's using a port"
+            };
+            ui.add(egui::Label::new(RichText::new(hint).size(12.0).color(FAINT())).truncate());
         });
+        let port_act = match port_query(&self.search) {
+            Some(port) => self.port_banner(ui, port, &snap),
+            None => None,
+        };
         // Type anywhere to search.
         if !ctx.memory(|m| m.focused().is_some()) && self.modal.is_none() && !self.palette.open {
             let typed: String = ctx.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.clone()) } else { None }).collect());
@@ -560,6 +573,7 @@ impl App {
         let sel_proc = self.selected.and_then(|k| snap.procs.iter().find(|p| p.key() == k).cloned());
         let show_details = self.details_open && (sel_proc.is_some() || self.sel_group.is_some());
         let mut acts: Vec<Act> = Vec::new();
+        acts.extend(port_act);
         // Slide-in details panel.
         let target_w = if show_details { 360.0 } else { 0.0 };
         let w = ctx.animate_value_with_time(egui::Id::unique("details-w"), target_w, 0.16);
@@ -852,8 +866,15 @@ impl App {
                 pill(ui, "Suspended", BLUE());
             }
         }
+        if let Some(l) = self.leak_for(&p.name) {
+            let t = l.text();
+            pill(ui, "Memory growing", ORANGE()).on_hover_text(format!("{t}\nIf it keeps climbing, restarting the app frees the memory."));
+        }
         if !group {
-            if let Some(e) = exe {
+            let role = self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.cmdline.clone()).and_then(|c| crate::roles::role(&c));
+            if let Some(r) = role {
+                ui.add(egui::Label::new(RichText::new(r).size(11.5).color(FAINT())).truncate().selectable(false));
+            } else if let Some(e) = exe {
                 ui.add(egui::Label::new(RichText::new(e).size(11.5).color(FAINT())).truncate().selectable(false));
             }
             if let Some(svcs) = self.snap.services_by_pid.get(&p.pid) {
@@ -1071,7 +1092,7 @@ impl App {
                     Ok(()) => self.toast(ToastKind::Good, msg),
                     Err(e) => self.toast(ToastKind::Bad, format!("Couldn't change {name}: {e}")),
                 }
-                self.ctl.refresh_now.store(true, Ordering::Relaxed);
+                self.ctl.refresh();
             }
             Act::Priority(p, pr) => self.set_priority(&p, pr),
             Act::Affinity(pid, name) => {
@@ -1301,12 +1322,16 @@ impl App {
                 }
             });
             ui.add_space(10.0);
+            self.app_history_card(ui, &p.name);
 
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 label_caps(ui, "Details");
                 let parent = snap.procs.iter().find(|x| x.pid == p.ppid && x.create_time <= p.create_time);
                 kv(ui, "PID", &p.pid.to_string());
+                if let Some(r) = meta.as_ref().and_then(|m| m.cmdline.as_deref()).and_then(crate::roles::role) {
+                    kv(ui, "Role", &r);
+                }
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Parent").color(FAINT()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| match parent {
@@ -1414,6 +1439,96 @@ impl App {
         });
     }
 
+    /// Last 6 / 24 hours of this app's CPU and memory (all its processes together).
+    fn app_history_card(&mut self, ui: &mut Ui, exe: &str) {
+        let now = win::now_unix();
+        let range = if self.app_range == 0 { 6 * 3600 } else { 86400 };
+        let (cpu, mem, have) = {
+            let sh = self.shared.lock().unwrap();
+            let s = sh.apphist.series(exe);
+            let have = s.and_then(|s| s.m.first().copied()).map(|m| now - m as i64 * 60).unwrap_or(0);
+            let (c, m) = crate::apphist::buckets(s, now, range, crate::sampler::HIST);
+            (c, m, have)
+        };
+        let leak = self.leak_for(exe).cloned();
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                label_caps(ui, "History");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let mut r = self.app_range;
+                    if segmented(ui, &mut r, &["6 h", "24 h"]) {
+                        self.app_range = r;
+                    }
+                });
+            });
+            if let Some(l) = &leak {
+                egui::Frame::new().fill(ORANGE().gamma_multiply(0.12)).stroke(Stroke::new(1.0, ORANGE().gamma_multiply(0.35))).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(format!("{}  Possible memory leak. {}", I::WARNING, l.text())).size(12.0).color(TEXT()));
+                });
+                ui.add_space(6.0);
+            }
+            if cpu.iter().all(|v| v.is_nan()) {
+                ui.label(RichText::new("Nothing recorded yet. Sentinel records each app once a minute while it uses more than 30 MB or 0.5% CPU.").size(12.0).color(FAINT()));
+                return;
+            }
+            let w = ui.available_width();
+            let interval = range as f32 / crate::sampler::HIST as f32;
+            let (rect, _) = ui.allocate_exact_size(vec2(w, 74.0), Sense::hover());
+            let ex = crate::graph::Ex { end_unix: Some(now as f64), link: Some("app"), select: false };
+            crate::graph::graph_ex(ui, rect, &[crate::graph::Series { data: &mem, color: C_MEM(), label: "Memory" }], &crate::graph::Opts { max: None, fmt: &|v| fmt::bytes(v as u64), offset: 0.0, grid: true, rounded: true, interval }, &ex);
+            ui.add_space(4.0);
+            let (rect, _) = ui.allocate_exact_size(vec2(w, 58.0), Sense::hover());
+            crate::graph::graph_ex(ui, rect, &[crate::graph::Series { data: &cpu, color: C_CPU(), label: "CPU" }], &crate::graph::Opts { max: None, fmt: &|v| format!("{v:.0}%"), offset: 0.0, grid: true, rounded: true, interval }, &ex);
+            crate::graph::range_stats(ui, &mem, &|v| fmt::bytes(v as u64), now as f64, interval, C_MEM());
+            if have < range - 300 {
+                ui.label(RichText::new(format!("Recorded for {} so far", fmt::duration(have.max(0) as u64))).size(11.0).color(FAINT()));
+            }
+        });
+        ui.add_space(10.0);
+    }
+
+    /// Search ":3000": who listens on / talks over the port, with a one-click fix.
+    fn port_banner(&mut self, ui: &mut Ui, port: u16, snap: &Snapshot) -> Option<Act> {
+        let mut listeners: Vec<(u32, &str)> = Vec::new();
+        let mut users = 0usize;
+        for c in &snap.conns {
+            if c.local.port() == port && (c.state == 2 || c.proto == crate::net::Proto::Udp) {
+                if !listeners.iter().any(|(p, _)| *p == c.pid) {
+                    listeners.push((c.pid, if c.proto == crate::net::Proto::Udp { "UDP" } else { "TCP" }));
+                }
+            } else if c.local.port() == port || c.remote.is_some_and(|r| r.port() == port) {
+                users += 1;
+            }
+        }
+        ui.add_space(8.0);
+        let col = if listeners.is_empty() { GOOD() } else { WARN() };
+        let mut kill: Option<Act> = None;
+        egui::Frame::new().fill(col.gamma_multiply(0.10)).stroke(Stroke::new(1.0, col.gamma_multiply(0.35))).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 9)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if listeners.is_empty() {
+                ui.label(RichText::new(format!("{}  Port {port} is free: nothing is listening on it.{}", I::CHECK_CIRCLE, if users > 0 { format!(" {users} connection(s) use it as their remote port.") } else { String::new() })).color(TEXT()));
+                return;
+            }
+            for (pid, proto) in &listeners {
+                let Some(p) = snap.procs.iter().find(|p| p.pid == *pid) else { continue };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(I::PLUGS_CONNECTED).color(WARN()));
+                    let (name, _) = self.display_name(p);
+                    ui.label(RichText::new(format!("{name} is listening on {proto} port {port}")).color(TEXT()));
+                    ui.label(RichText::new(format!("{} · PID {}", p.name, p.pid)).size(12.0).color(FAINT()));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if button_sized(ui, Btn::Danger, I::X_CIRCLE, "Free this port", !crate::sampler::critical(&p.name) && p.pid > 4, 26.0).on_hover_text("End the process that holds it").clicked() {
+                            kill = Some(Act::Kill(vec![p.key()], vec![p.name.clone()], format!("End {} to free port {port}?", p.name)));
+                        }
+                    });
+                });
+            }
+        });
+        kill
+    }
+
     fn group_details(&mut self, ui: &mut Ui, g: &str, snap: &Snapshot, _rows: &[Row], acts: &mut Vec<Act>) {
         let members: Vec<&Proc> = snap.procs.iter().filter(|p| group_key_matches(g, p)).collect();
         if members.is_empty() {
@@ -1448,6 +1563,43 @@ impl App {
                 });
             });
             ui.add_space(10.0);
+            self.app_history_card(ui, &first.name);
+            // What the helper processes are for (browsers and Electron apps).
+            let mut roles: Vec<(String, usize, f32, u64)> = Vec::new();
+            for p in &members {
+                let cmd = self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.cmdline.clone()).unwrap_or_default();
+                let r = crate::roles::role(&cmd).unwrap_or_else(|| if members.len() > 1 && crate::roles::is_main(&cmd) { "Main process".into() } else { String::new() });
+                if r.is_empty() {
+                    continue;
+                }
+                match roles.iter_mut().find(|x| x.0 == r) {
+                    Some(x) => {
+                        x.1 += 1;
+                        x.2 += p.cpu;
+                        x.3 += p.mem;
+                    }
+                    None => roles.push((r, 1, p.cpu, p.mem)),
+                }
+            }
+            if roles.len() > 1 {
+                roles.sort_by(|a, b| b.3.cmp(&a.3));
+                card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    label_caps(ui, "What the processes do");
+                    let total = mem.max(1) as f32;
+                    for (r, n, c, m) in &roles {
+                        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+                        let p = ui.painter();
+                        p.text(rect.left_top() + vec2(0.0, 2.0), egui::Align2::LEFT_TOP, if *n > 1 { format!("{r}  ×{n}") } else { r.clone() }, egui::FontId::proportional(13.0), TEXT());
+                        p.text(rect.right_top() + vec2(0.0, 2.0), egui::Align2::RIGHT_TOP, format!("{}  ·  {}", fmt::pct(*c), fmt::bytes(*m)), egui::FontId::proportional(12.0), MUTED());
+                        let bar = egui::Rect::from_min_size(rect.left_top() + vec2(0.0, 22.0), vec2(rect.width(), 4.0));
+                        p.rect_filled(bar, CornerRadius::same(2), FIELD());
+                        p.rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * (*m as f32 / total).clamp(0.0, 1.0), 4.0)), CornerRadius::same(2), C_MEM());
+                    }
+                    ui.label(RichText::new("Tab titles aren't visible from outside the browser; its own task manager (Shift+Esc in Chrome and Edge) can show them per tab.").size(11.5).color(FAINT()));
+                });
+                ui.add_space(10.0);
+            }
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 label_caps(ui, "Processes");
@@ -1458,8 +1610,9 @@ impl App {
                     let r = ui.horizontal(|ui| {
                         ui.add(egui::Label::new(RichText::new(title).size(12.5)).truncate().sense(Sense::click()))
                     });
+                    let role = self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.cmdline.clone()).and_then(|c| crate::roles::role(&c));
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} · {} · PID {}", fmt::pct(p.cpu), fmt::bytes(p.mem), p.pid)).size(11.0).color(FAINT()));
+                        ui.label(RichText::new(format!("{}{} · {} · PID {}", role.map(|r| format!("{r} · ")).unwrap_or_default(), fmt::pct(p.cpu), fmt::bytes(p.mem), p.pid)).size(11.0).color(FAINT()));
                     });
                     if r.inner.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         acts.push(Act::Select(p.key()));
@@ -1468,6 +1621,13 @@ impl App {
             });
         });
     }
+}
+
+/// ":3000" or "port 3000" in the search box.
+pub fn port_query(q: &str) -> Option<u16> {
+    let q = q.trim();
+    let n = q.strip_prefix(':').or_else(|| q.strip_prefix("port ")).or_else(|| q.strip_prefix("port:"))?;
+    n.trim().parse::<u16>().ok().filter(|p| *p > 0)
 }
 
 fn group_key_matches(g: &str, p: &Proc) -> bool {

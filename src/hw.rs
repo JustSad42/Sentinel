@@ -643,6 +643,40 @@ fn query(class: u32, buf: &mut Vec<u8>) -> bool {
     false
 }
 
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtSetSystemInformation(class: u32, info: *const c_void, len: u32) -> i32;
+}
+
+/// Empties the standby list (cached file data Windows keeps "just in case"). Returns bytes freed.
+pub fn purge_standby() -> Result<u64, String> {
+    enable_privilege("SeProfileSingleProcessPrivilege");
+    let before = avail_bytes();
+    let cmd: u32 = 4; // MemoryPurgeStandbyList
+    let st = unsafe { NtSetSystemInformation(80, &cmd as *const u32 as *const c_void, 4) };
+    if st != 0 {
+        return Err(format!("Windows refused (0x{:08X}). Needs administrator rights.", st as u32));
+    }
+    Ok(avail_bytes().saturating_sub(before).max(0))
+}
+
+fn avail_bytes() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    // Standby pages count as available, so measure "free" (zero + free lists) instead.
+    let mut info = [0u64; 64];
+    let mut ret = 0u32;
+    let st = unsafe { NtQuerySystemInformation(80, info.as_mut_ptr() as *mut c_void, std::mem::size_of_val(&info) as u32, &mut ret) };
+    if st == 0 {
+        // SYSTEM_MEMORY_LIST_INFORMATION: ZeroPageCount, FreePageCount are the first two fields.
+        (info[0] + info[1]) * 4096
+    } else {
+        m.ullAvailPhys
+    }
+}
+
 fn enable_privilege(name: &str) {
     unsafe {
         let mut tok = std::ptr::null_mut();

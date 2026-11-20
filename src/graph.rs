@@ -70,11 +70,57 @@ fn fill_mesh(rect: Rect, pts: &[Pos2], color: Color32) -> Mesh {
     mesh
 }
 
-/// Full graph in `rect`. Returns the hovered sample value of the first series.
+/// Extra behaviour for [`graph_ex`]: a real time axis, a crosshair shared between graphs, and
+/// drag-to-zoom / click / double-click handling.
+#[derive(Default, Clone, Copy)]
+pub struct Ex<'a> {
+    /// Unix time of the newest sample. Turns on clock-time ticks and labels.
+    pub end_unix: Option<f64>,
+    /// Graphs with the same link show the same moment when any one of them is hovered.
+    pub link: Option<&'a str>,
+    /// Drag to select a time range, click a moment, double-click to reset.
+    pub select: bool,
+}
+
+pub struct Out {
+    pub resp: egui::Response,
+    /// Drag-selected range (unix start, end).
+    pub selected: Option<(f64, f64)>,
+    /// Clicked moment (unix) and where on screen.
+    pub clicked: Option<(f64, Pos2)>,
+    pub reset: bool,
+    /// Mouse wheel over the graph (positive = zoom in), with the time under the pointer.
+    pub wheel: Option<(f32, f64)>,
+}
+
+/// Full graph in `rect`.
 pub fn graph(ui: &mut Ui, rect: Rect, series: &[Series], o: &Opts) -> egui::Response {
-    let resp = ui.allocate_rect(rect, egui::Sense::hover());
+    graph_ex(ui, rect, series, o, &Ex::default()).resp
+}
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Clock label for a tick or tooltip; detail depends on how far apart ticks are.
+pub fn time_label(t: f64, step: f64) -> String {
+    let (_, mo, d, h, mi, s) = crate::fmt::civil(t.round() as i64);
+    if step < 60.0 {
+        format!("{h:02}:{mi:02}:{s:02}")
+    } else if step < 86400.0 {
+        format!("{h:02}:{mi:02}")
+    } else {
+        format!("{d} {}", MONTHS[(mo as usize).saturating_sub(1).min(11)])
+    }
+}
+
+pub fn graph_ex(ui: &mut Ui, rect: Rect, series: &[Series], o: &Opts, ex: &Ex) -> Out {
+    let resp = ui.allocate_rect(rect, if ex.select { egui::Sense::click_and_drag() } else { egui::Sense::hover() });
     let painter = ui.painter_at(rect);
     let max = o.max.unwrap_or_else(|| nice_max(series.iter().flat_map(|s| s.data.iter().copied()).fold(0.0f32, f32::max) * 1.1));
+    let step = rect.width() / (HIST as f32 - 2.0);
+    let interval = o.interval.max(1e-3) as f64;
+    let end = ex.end_unix.unwrap_or(0.0);
+    let x_of = |t: f64| rect.right() - (((end - t) / interval) as f32 + o.offset) * step;
+    let back_at = |x: f32| (((rect.right() - x) / step) - o.offset).round().max(0.0) as usize;
     if o.rounded {
         painter.rect_filled(rect, CornerRadius::same(8), FIELD());
     }
@@ -83,12 +129,28 @@ pub fn graph(ui: &mut Ui, rect: Rect, series: &[Series], o: &Opts) -> egui::Resp
             let y = rect.top() + rect.height() * i as f32 / 4.0;
             painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0, BORDER_SOFT()));
         }
-        let step = rect.width() / (HIST as f32 - 2.0);
-        let cols = 6;
-        for i in 1..cols {
-            // Vertical lines scroll with the data.
-            let x = rect.right() - (i as f32 * (HIST as f32 / cols as f32) + o.offset) * step;
-            painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, BORDER_SOFT().gamma_multiply(0.6)));
+        if ex.end_unix.is_some() {
+            // Ticks on round clock times (local), at most ~6 across.
+            let span = (rect.width() / step) as f64 * interval;
+            let steps = [10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0, 21600.0, 43200.0, 86400.0];
+            let ts = steps.iter().copied().find(|s| span / s <= 6.5).unwrap_or(86400.0);
+            let lo = crate::fmt::local_offset_secs() as f64;
+            let mut t = ((end - span + lo) / ts).ceil() * ts - lo;
+            while t <= end {
+                let x = x_of(t);
+                if x > rect.left() + 2.0 && x < rect.right() - 2.0 {
+                    painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, BORDER_SOFT().gamma_multiply(0.6)));
+                    painter.text(pos2(x + 4.0, rect.bottom() - 3.0), egui::Align2::LEFT_BOTTOM, time_label(t, ts), egui::FontId::proportional(10.0), FAINT());
+                }
+                t += ts;
+            }
+        } else {
+            let cols = 6;
+            for i in 1..cols {
+                // Vertical lines scroll with the data.
+                let x = rect.right() - (i as f32 * (HIST as f32 / cols as f32) + o.offset) * step;
+                painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, BORDER_SOFT().gamma_multiply(0.6)));
+            }
         }
     }
     for s in series {
@@ -104,11 +166,23 @@ pub fn graph(ui: &mut Ui, rect: Rect, series: &[Series], o: &Opts) -> egui::Resp
     }
     // Axis max label.
     painter.text(rect.left_top() + vec2(6.0, 4.0), egui::Align2::LEFT_TOP, (o.fmt)(max), egui::FontId::proportional(10.5), FAINT());
-    if let Some(p) = resp.hover_pos() {
-        let step = rect.width() / (HIST as f32 - 2.0);
-        let back = (((rect.right() - p.x) / step) - o.offset).round().max(0.0) as usize;
+
+    // Which sample is hovered: this graph's pointer, or the same moment from a linked graph.
+    let ctx = ui.ctx().clone();
+    let frame = ctx.cumulative_frame_nr();
+    let link_id = ex.link.filter(|_| ex.end_unix.is_some()).map(|l| egui::Id::unique(("graph-link", l)));
+    let own = resp.hover_pos().filter(|p| rect.contains(*p));
+    let back = match own {
+        Some(p) => Some(back_at(p.x)),
+        None => link_id.and_then(|id| ctx.data(|d| d.get_temp::<(u64, f64)>(id))).filter(|(f, _)| *f + 1 >= frame).map(|(_, t)| ((end - t) / interval).round().max(0.0) as usize),
+    };
+    if let (Some(p), Some(id)) = (own, link_id) {
+        let t = end - back_at(p.x) as f64 * interval;
+        ctx.data_mut(|d| d.insert_temp(id, (frame, t)));
+    }
+    if let Some(back) = back {
         let x = rect.right() - (back as f32 + o.offset) * step;
-        painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, MUTED().gamma_multiply(0.5)));
+        painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, MUTED().gamma_multiply(if own.is_some() { 0.5 } else { 0.35 })));
         let mut lines = Vec::new();
         for s in series {
             if back < s.data.len() && !s.data[s.data.len() - 1 - back].is_nan() {
@@ -119,26 +193,107 @@ pub fn graph(ui: &mut Ui, rect: Rect, series: &[Series], o: &Opts) -> egui::Resp
                 lines.push((s.color, if s.label.is_empty() { (o.fmt)(v) } else { format!("{}  {}", s.label, (o.fmt)(v)) }));
             }
         }
-        if !lines.is_empty() {
-            let secs = (back as f32 * o.interval).round() as u64;
-            egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), resp.id.with("tip"), egui::PopupAnchor::Pointer).gap(12.0).show(|ui| {
+        if own.is_none() {
+            // Linked: show the first value as a small tag instead of a tooltip.
+            if let Some((c, t)) = lines.first() {
+                let g = painter.layout_no_wrap(t.clone(), bold(11.0), *c);
+                let tag = Rect::from_min_size(pos2((x + 6.0).min(rect.right() - g.size().x - 10.0), rect.top() + 4.0), g.size() + vec2(8.0, 4.0));
+                painter.rect_filled(tag, CornerRadius::same(4), CARD_HI());
+                painter.galley(tag.min + vec2(4.0, 2.0), g, *c);
+            }
+        } else if !lines.is_empty() {
+            let secs = (back as f64 * interval).round() as u64;
+            egui::Tooltip::always_open(ctx.clone(), ui.layer_id(), resp.id.with("tip"), egui::PopupAnchor::Pointer).gap(12.0).show(|ui| {
                 let ago = if secs == 0 {
                     "now".to_string()
                 } else if secs < 120 {
                     format!("{secs}s ago")
                 } else if secs < 7200 {
                     format!("{} min ago", secs / 60)
-                } else {
+                } else if secs < 172800 {
                     format!("{}h {:02}m ago", secs / 3600, (secs % 3600) / 60)
+                } else {
+                    format!("{} days ago", secs / 86400)
                 };
-                ui.label(egui::RichText::new(ago).size(11.0).color(FAINT()));
+                let when = if ex.end_unix.is_some() { format!("{}  ·  {ago}", time_label(end - back as f64 * interval, if interval >= 600.0 { 86400.0 } else if interval >= 1.0 && secs >= 60 { 60.0 } else { 1.0 })) } else { ago };
+                ui.label(egui::RichText::new(when).size(11.0).color(FAINT()));
                 for (c, t) in lines {
                     ui.label(egui::RichText::new(t).color(c).font(bold(12.5)));
+                }
+                if ex.select {
+                    ui.label(egui::RichText::new("Click: what was running  ·  Drag: zoom  ·  Double-click: reset").size(10.5).color(FAINT()));
                 }
             });
         }
     }
-    resp
+
+    let mut out = Out { resp: resp.clone(), selected: None, clicked: None, reset: false, wheel: None };
+    if ex.select && ex.end_unix.is_some() {
+        let sel_id = resp.id.with("drag-from");
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                ctx.data_mut(|d| d.insert_temp(sel_id, p.x));
+            }
+        }
+        let from: Option<f32> = ctx.data(|d| d.get_temp(sel_id));
+        if let (Some(fx), Some(p)) = (from, resp.interact_pointer_pos()) {
+            if resp.dragged() {
+                let (a, b) = (fx.min(p.x).max(rect.left()), fx.max(p.x).min(rect.right()));
+                painter.rect_filled(Rect::from_x_y_ranges(a..=b, rect.y_range()), CornerRadius::ZERO, ACCENT().gamma_multiply(0.18));
+                painter.line_segment([pos2(a, rect.top()), pos2(a, rect.bottom())], Stroke::new(1.0, ACCENT()));
+                painter.line_segment([pos2(b, rect.top()), pos2(b, rect.bottom())], Stroke::new(1.0, ACCENT()));
+            }
+        }
+        if resp.drag_stopped() {
+            if let (Some(fx), Some(p)) = (from, resp.interact_pointer_pos()) {
+                let (a, b) = (fx.min(p.x).max(rect.left()), fx.max(p.x).min(rect.right()));
+                if b - a > 8.0 {
+                    let t = |x: f32| end - ((((rect.right() - x) / step) - o.offset).max(0.0) as f64) * interval;
+                    out.selected = Some((t(a), t(b)));
+                }
+            }
+            ctx.data_mut(|d| d.remove::<f32>(sel_id));
+        }
+        if resp.double_clicked() {
+            out.reset = true;
+        } else if resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                out.clicked = Some((end - back_at(p.x) as f64 * interval, p));
+            }
+        }
+        if let Some(p) = own {
+            // Ctrl + wheel (egui turns it into a zoom delta).
+            let z = ui.input(|i| i.zoom_delta());
+            if (z - 1.0).abs() > 0.001 {
+                out.wheel = Some((if z > 1.0 { 1.0 } else { -1.0 }, end - back_at(p.x) as f64 * interval));
+            }
+        }
+    }
+    out
+}
+
+/// "Low · Average · Peak (at 14:32)" for what a graph currently shows.
+pub fn range_stats(ui: &mut Ui, data: &VecDeque<f32>, f: &dyn Fn(f32) -> String, end_unix: f64, interval: f32, color: Color32) {
+    let vals: Vec<(usize, f32)> = data.iter().copied().enumerate().filter(|(_, v)| v.is_finite()).collect();
+    if vals.len() < 2 {
+        return;
+    }
+    let lo = vals.iter().map(|v| v.1).fold(f32::INFINITY, f32::min);
+    let avg = vals.iter().map(|v| v.1).sum::<f32>() / vals.len() as f32;
+    let (pi, pk) = vals.iter().copied().fold((0, f32::NEG_INFINITY), |a, b| if b.1 > a.1 { b } else { a });
+    let when = end_unix - (data.len() - 1 - pi) as f64 * interval as f64;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let item = |ui: &mut Ui, k: &str, v: String, c: Color32| {
+            ui.label(egui::RichText::new(k).size(11.5).color(FAINT()));
+            ui.label(egui::RichText::new(v).size(12.0).font(bold(12.0)).color(c));
+            ui.add_space(8.0);
+        };
+        item(ui, "Low", f(lo), MUTED());
+        item(ui, "Average", f(avg), TEXT());
+        item(ui, "Peak", f(pk), color);
+        ui.label(egui::RichText::new(format!("at {}", time_label(when, if interval >= 600.0 { 86400.0 } else if interval >= 1.0 { 60.0 } else { 1.0 }))).size(11.5).color(FAINT()));
+    });
 }
 
 /// Small sparkline without axes, showing the last minute.

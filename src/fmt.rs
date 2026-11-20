@@ -89,7 +89,7 @@ pub fn cpu_time(t100ns: u64) -> String {
     format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
-fn local_offset_secs() -> i64 {
+pub fn local_offset_secs() -> i64 {
     use windows_sys::Win32::System::Time::*;
     unsafe {
         let mut tz: TIME_ZONE_INFORMATION = std::mem::zeroed();

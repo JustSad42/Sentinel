@@ -6,7 +6,6 @@ use crate::icons as I;
 use crate::sampler::Proc;
 use crate::theme::*;
 use egui::{Color32, CornerRadius, RichText, Sense, Stroke, vec2};
-use std::sync::atomic::Ordering;
 
 #[derive(Default)]
 pub struct Palette {
@@ -391,7 +390,7 @@ impl App {
                         }
                     }
                 }
-                self.ctl.refresh_now.store(true, Ordering::Relaxed);
+                self.ctl.refresh();
             }
         }
         self.palette.open = false;

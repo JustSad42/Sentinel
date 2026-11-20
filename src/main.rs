@@ -4,6 +4,7 @@
 mod actions;
 mod admin;
 mod app;
+mod apphist;
 mod apps;
 mod boot;
 mod config;
@@ -19,6 +20,7 @@ mod overlay;
 mod palette;
 mod pdh;
 mod report;
+mod roles;
 mod sampler;
 mod services;
 mod startup;
@@ -57,16 +59,37 @@ fn main() -> eframe::Result<()> {
     }
 
     // Single instance: a second launch (Start menu, IFEO via Ctrl+Shift+Esc / taskmgr) just shows the first.
+    if let Some(i) = args.iter().position(|a| a == "--locks") {
+        if let Some(p) = args.get(i + 1) {
+            integration::request_locks(p);
+        }
+    }
     let mut instance = integration::acquire(has("--takeover"));
-    if instance.is_none() && integration::signal_existing() {
-        return Ok(());
+    // A launch right after sign-in that nobody asked for (app restore, the Task Manager redirect)
+    // must not pop the window up: treat it like --background.
+    let quiet = !has("--show") && !has("--takeover") && !has("--locks") && integration::sign_in_launch();
+    integration::log_launch(&format!(
+        "args={:?} elevated={} running={} sign_in={} idle_ms={} quiet={quiet}",
+        &args[1..],
+        win::is_elevated(),
+        instance.is_none(),
+        integration::secs_since_sign_in().map(|s| format!("{s:.0}s")).unwrap_or("?".into()),
+        integration::idle_ms()
+    ));
+    if instance.is_none() {
+        if quiet {
+            return Ok(());
+        }
+        if integration::signal_existing() {
+            return Ok(());
+        }
     }
 
     // Sentinel always runs as administrator. Hand off to the elevated launch task (no UAC prompt),
     // or on the very first run ask once; the elevated copy then registers the task.
     if !win::is_elevated() && !integration::is_dev_build() && !has("--no-elevate") {
         drop(instance.take());
-        if !has("--background") {
+        if !has("--background") && !quiet {
             integration::request_show_on_start();
         }
         if admin::run_task() {
@@ -83,7 +106,11 @@ fn main() -> eframe::Result<()> {
 
     hw::warm();
     let cfg = config::Config::load();
-    let start_hidden = has("--background") && !has("--show") && !integration::take_show_on_start();
+    // Keep the Explorer menu pointing at this copy (it moves on reinstall/update).
+    if cfg.explorer_menu && !integration::is_dev_build() && win::is_elevated() {
+        let _ = integration::set_explorer_menu(true);
+    }
+    let start_hidden = (has("--background") || quiet) && !has("--show") && !integration::take_show_on_start();
     let size = cfg.window_size.unwrap_or([1320.0, 820.0]);
     let title = if config::test_mode() { "Sentinel (TEST COPY)" } else { "Sentinel" };
     let options = eframe::NativeOptions {

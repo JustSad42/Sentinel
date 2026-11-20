@@ -118,7 +118,7 @@ pub fn restart(p: &Proc) -> Result<(), String> {
             return Ok(());
         }
     }
-    win::shell_open(&path, &args, "")
+    win::launch_as_user(&path, &args, None)
 }
 
 fn is_running(name: &str) -> bool {

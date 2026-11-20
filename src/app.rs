@@ -56,6 +56,8 @@ pub struct Toast {
     pub kind: ToastKind,
     pub born: f64,
     pub retry: Option<AdminOp>,
+    /// "Undo" after ending apps: (program, arguments) to start again.
+    pub undo: Option<Vec<(String, String)>>,
 }
 
 pub enum Modal {
@@ -120,8 +122,12 @@ pub struct App {
     pub sort_cache: std::cell::RefCell<crate::ui_procs::SortCache>,
     pub palette: crate::palette::Palette,
     pub overlay_styled: bool,
+    /// (opacity, click-through) last applied to the overlay window.
+    pub overlay_style: (f32, bool),
     /// Exe name to re-select once its process shows up (selection survives restarts).
     pub pending_select: Option<String>,
+    /// File/folder from Explorer's "What's using this?" waiting to be checked.
+    pub pending_locks: Option<String>,
     pub only_hung: bool,
     pub only_suspended: bool,
     pub scroll_to_sel: bool,
@@ -133,6 +139,20 @@ pub struct App {
     pub per_core: bool,
     /// Performance graphs: 0 = live, 1 = last hour, 2 = last 24 hours.
     pub perf_range: usize,
+    /// Zoomed time window on the Performance graphs (unix start, end).
+    pub perf_zoom: Option<(f64, f64)>,
+    pub perf_expanded: bool,
+    /// Clicked moment on a Performance graph: (unix, bucket seconds, by memory?, screen pos, frame).
+    pub perf_pick: Option<(f64, f64, bool, egui::Pos2, u64)>,
+    /// Long-range series, rebuilt only when the window moves (see ui_perf::LongSeries).
+    pub perf_cache: Option<((i64, i64, usize), std::rc::Rc<crate::ui_perf::LongSeries>)>,
+    /// Details panel history range: 0 = 6 hours, 1 = 24 hours.
+    pub app_range: usize,
+    /// Rules page: 0 = when an app runs, 1 = scheduled.
+    pub rules_tab: usize,
+    /// Apps whose memory keeps growing (refreshed every minute) and the ones already announced.
+    pub leaks: (Option<Instant>, Vec<crate::apphist::Leak>),
+    pub leak_told: std::collections::HashSet<String>,
 
     // network
     pub net_tab: usize,
@@ -187,17 +207,24 @@ impl App {
         install(&cc.egui_ctx);
         crate::theme::apply_theme(&cc.egui_ctx, &cfg);
         let (history, log) = crate::sampler::load_history();
+        let long = crate::sampler::load_long();
         let shared = Arc::new(Mutex::new(Shared {
             snap: Arc::new(Snapshot::default()),
             sys: Default::default(),
-            long: crate::sampler::load_long(),
+            long: long.clone(),
+            week: crate::sampler::load_week(&long),
             proc_hist: HashMap::new(),
+            apphist: crate::apphist::AppHist::load(),
             history,
             running_idx: HashMap::new(),
             log,
             rules: cfg.rules.clone(),
+            schedules: cfg.schedules.clone(),
+            sched_last: crate::sampler::load_sched_last(),
+            sched_run_now: Vec::new(),
         }));
         let ctl = Arc::new(Control {
+            thread: Default::default(),
             interval_ms: cfg.refresh_ms.into(),
             visible: (!start_hidden).into(),
             refresh_now: false.into(),
@@ -276,7 +303,7 @@ impl App {
             quit: false,
             last_save: Instant::now(),
             instance,
-            search: String::new(),
+            search: std::env::var("SENTINEL_SEARCH").ok().filter(|_| crate::config::test_mode()).unwrap_or_default(),
             selected: None,
             sel_group: None,
             details_open: true,
@@ -286,7 +313,9 @@ impl App {
             sort_cache: Default::default(),
             palette: crate::palette::Palette::test_open(),
             overlay_styled: false,
+            overlay_style: (1.0, false),
             pending_select: cfg.last_selected.clone(),
+            pending_locks: integration::take_locks_request(),
             only_hung: false,
             only_suspended: false,
             scroll_to_sel: false,
@@ -295,6 +324,14 @@ impl App {
             perf_sel: std::env::var("SENTINEL_PERF").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| crate::config::test_mode()).map(|i| 100 + i).unwrap_or(0),
             per_core: false,
             perf_range: std::env::var("SENTINEL_RANGE").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| crate::config::test_mode()).unwrap_or(0),
+            perf_zoom: None,
+            perf_expanded: crate::config::test_mode() && std::env::var_os("SENTINEL_EXPAND").is_some(),
+            perf_pick: std::env::var("SENTINEL_PICK_AGO").ok().and_then(|v| v.parse::<f64>().ok()).filter(|_| crate::config::test_mode()).map(|a| (crate::win::now_unix() as f64 - a, 576.0, false, egui::pos2(760.0, 330.0), 0)),
+            perf_cache: None,
+            app_range: 1,
+            rules_tab: std::env::var("SENTINEL_RULES_TAB").ok().and_then(|v| v.parse().ok()).filter(|_| crate::config::test_mode()).unwrap_or(0),
+            leaks: (None, Vec::new()),
+            leak_told: Default::default(),
             net_tab: std::env::var("SENTINEL_NET").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| crate::config::test_mode()).unwrap_or(0),
             net_search: String::new(),
             net_hide_listen: false,
@@ -344,11 +381,11 @@ impl App {
     // ------------------------------------------------------------ helpers
 
     pub fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
-        self.toasts.push(Toast { text: text.into(), kind, born: 0.0, retry: None });
+        self.toasts.push(Toast { text: text.into(), kind, born: 0.0, retry: None, undo: None });
     }
 
     pub fn toast_retry(&mut self, text: impl Into<String>, op: AdminOp) {
-        self.toasts.push(Toast { text: text.into(), kind: ToastKind::Bad, born: 0.0, retry: Some(op) });
+        self.toasts.push(Toast { text: text.into(), kind: ToastKind::Bad, born: 0.0, retry: Some(op), undo: None });
     }
 
     pub fn log(&self, kind: LogKind, text: impl Into<String>) {
@@ -394,7 +431,7 @@ impl App {
             Err(e) if admin_needed(&e) && !self.elevated => self.toast_retry(format!("{e}. This needs admin rights."), op),
             Err(e) => self.toast(ToastKind::Bad, e),
         }
-        self.ctl.refresh_now.store(true, Ordering::Relaxed);
+        self.ctl.refresh();
     }
 
     pub fn run_admin_async(&self, op: AdminOp, done: String, after: Option<Msg>) {
@@ -423,11 +460,55 @@ impl App {
         }
     }
 
+    /// What to start again if the user hits Undo: only the top process of each ended app (its
+    /// helpers are started by it), never services or Windows' own processes.
+    fn relaunch_plan(&self, targets: &[(u32, i64)]) -> Vec<(String, String)> {
+        let set: std::collections::HashSet<u32> = targets.iter().map(|t| t.0).collect();
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (pid, ct) in targets {
+            let Some(p) = self.snap.procs.iter().find(|p| p.pid == *pid && p.create_time == *ct) else { continue };
+            let Some(path) = p.path.as_deref() else { continue };
+            let lower = path.to_lowercase();
+            if set.contains(&p.ppid) || crate::sampler::critical(&p.name) || self.snap.services_by_pid.contains_key(&p.pid) || lower.contains("\\windows\\system32\\") {
+                continue;
+            }
+            let cmd = self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.cmdline.clone()).or_else(|| win::command_line(p.pid)).unwrap_or_default();
+            let args = actions::split_args(&cmd).1;
+            if !out.iter().any(|(e, a)| e.eq_ignore_ascii_case(path) && *a == args) {
+                out.push((path.to_string(), args));
+            }
+        }
+        out.truncate(8);
+        out
+    }
+
+    /// Re-checks for apps with steadily growing memory once a minute; announces each one once.
+    pub fn refresh_leaks(&mut self) {
+        if self.leaks.0.is_some_and(|t| t.elapsed().as_secs() < 60) {
+            return;
+        }
+        let list = self.shared.lock().unwrap().apphist.leaks(win::now_unix());
+        for l in &list {
+            if self.leak_told.insert(l.name.clone()) {
+                let shown = self.snap.procs.iter().find(|p| p.name.eq_ignore_ascii_case(&l.name)).and_then(|p| self.info.meta(p.key(), p.path.as_ref()).and_then(|m| m.description.clone())).filter(|d| !d.is_empty()).unwrap_or_else(|| l.name.clone());
+                let text = format!("{shown} may be leaking memory. {}", l.text());
+                self.log(LogKind::Info, text.clone());
+                self.toast(ToastKind::Info, text);
+            }
+        }
+        self.leaks = (Some(Instant::now()), list);
+    }
+
+    pub fn leak_for(&self, name: &str) -> Option<&crate::apphist::Leak> {
+        self.leaks.1.iter().find(|l| l.name.eq_ignore_ascii_case(name))
+    }
+
     pub fn do_kill(&mut self, targets: Vec<(u32, i64)>, names: Vec<String>) {
+        let plan = self.relaunch_plan(&targets);
         let (ok, errs) = actions::kill_many(&targets);
         let label = if names.len() == 1 { names[0].clone() } else { format!("{} processes", targets.len()) };
         if errs.is_empty() {
-            self.toast(ToastKind::Good, format!("Ended {label}"));
+            self.toasts.push(Toast { text: format!("Ended {label}"), kind: ToastKind::Good, born: 0.0, retry: None, undo: if plan.is_empty() { None } else { Some(plan) } });
             self.log(LogKind::Action, format!("Ended {label}"));
         } else if errs.iter().any(|e| admin_needed(e)) && !self.elevated {
             let msg = if ok > 0 { format!("Ended {ok}, {} need admin rights", errs.len()) } else { format!("Couldn't end {label}: access denied") };
@@ -435,7 +516,7 @@ impl App {
         } else {
             self.toast(ToastKind::Bad, format!("Couldn't end {label}: {}", errs[0]));
         }
-        self.ctl.refresh_now.store(true, Ordering::Relaxed);
+        self.ctl.refresh();
     }
 
     pub fn set_priority(&mut self, p: &Proc, pr: Priority) {
@@ -452,7 +533,11 @@ impl App {
     }
 
     pub fn sync_rules(&mut self) {
-        self.shared.lock().unwrap().rules = self.cfg.rules.clone();
+        {
+            let mut sh = self.shared.lock().unwrap();
+            sh.rules = self.cfg.rules.clone();
+            sh.schedules = self.cfg.schedules.clone();
+        }
         self.cfg.save();
     }
 
@@ -512,7 +597,7 @@ impl App {
                     if k == ToastKind::Good {
                         self.log(LogKind::Action, t.clone());
                     }
-                    self.toasts.push(Toast { text: t, kind: k, born: 0.0, retry });
+                    self.toasts.push(Toast { text: t, kind: k, born: 0.0, retry, undo: None });
                 }
                 Msg::Apps(a) => {
                     self.apps = Some(a);
@@ -595,10 +680,13 @@ impl App {
     fn on_show(&mut self, ctx: &egui::Context) {
         self.visible = true;
         self.ctl.visible.store(true, Ordering::Relaxed);
-        self.ctl.refresh_now.store(true, Ordering::Relaxed);
+        self.ctl.refresh();
         self.elevated = win::is_elevated();
         if self.page == Page::Processes {
             self.focus_search = true;
+        }
+        if let Some(p) = integration::take_locks_request() {
+            self.find_lockers(p);
         }
         ctx.request_repaint();
     }
@@ -660,7 +748,7 @@ impl App {
             self.focus_search = true;
         }
         if f5 {
-            self.ctl.refresh_now.store(true, Ordering::Relaxed);
+            self.ctl.refresh();
             match self.page {
                 Page::Apps => self.load_apps(),
                 Page::Startup => self.load_startup(),
@@ -715,7 +803,6 @@ impl App {
             ui.add_space(18.0);
             let snap = self.snap.clone();
             let sys_cpu = snap.cpu_total;
-            let mem_pct = if snap.mem_total > 0 { (snap.mem_total - snap.mem_avail) as f32 / snap.mem_total as f32 * 100.0 } else { 0.0 };
             let sel_idx = PAGES.iter().position(|p| p.0 == self.page).unwrap_or(0);
             let mut rects = Vec::new();
             for (i, (page, icon, label)) in PAGES.iter().enumerate() {
@@ -801,8 +888,46 @@ impl App {
                 }
                 ui.add_space(10.0);
                 if full {
-                    meter(ui, "Memory", mem_pct / 100.0, &format!("{:.0}%", mem_pct), C_MEM());
-                    meter(ui, "CPU", sys_cpu / 100.0, &format!("{:.0}%", sys_cpu), C_CPU());
+                    // Bottom-up layout: draw the last meter first so the list reads top to bottom.
+                    let items = self.cfg.sidebar_meters.clone();
+                    let r = ui
+                        .scope(|ui| {
+                            // Compact rows; skip the ones that would run into the menu on short windows.
+                            let fit = ((ui.available_height() - 8.0) / 38.0).floor().max(0.0) as usize;
+                            let shown: Vec<_> = items.iter().take(fit).collect();
+                            for it in shown.into_iter().rev() {
+                                let (text, color, frac) = self.meter_value(*it);
+                                let w = ui.available_width();
+                                let (r, _) = ui.allocate_exact_size(vec2(w, 36.0), Sense::hover());
+                                let p = ui.painter();
+                                p.text(r.left_top() + vec2(8.0, 2.0), egui::Align2::LEFT_TOP, it.label(), egui::FontId::proportional(11.5), MUTED());
+                                p.text(r.right_top() + vec2(-8.0, 1.0), egui::Align2::RIGHT_TOP, &text, bold(12.0), TEXT());
+                                let bar = egui::Rect::from_min_size(r.left_top() + vec2(8.0, 22.0), vec2(w - 16.0, 5.0));
+                                p.rect_filled(bar, CornerRadius::same(3), BORDER());
+                                p.rect_filled(egui::Rect::from_min_size(bar.min, vec2((bar.width() * frac).max(if frac > 0.0 { 3.0 } else { 0.0 }), 5.0)), CornerRadius::same(3), color);
+                            }
+                            if items.is_empty() {
+                                ui.label(RichText::new("Right-click to add meters").size(11.0).color(FAINT()));
+                            }
+                        })
+                        .response;
+                    let r = ui.interact(r.rect, egui::Id::unique("sidebar-meters"), Sense::click()).on_hover_text("Right-click to choose which meters show");
+                    r.context_menu(|ui| {
+                        ui.label(RichText::new("Show in the sidebar").size(11.5).color(FAINT()));
+                        for it in crate::config::OverlayItem::ALL {
+                            let mut on = self.cfg.sidebar_meters.contains(&it);
+                            if ui.checkbox(&mut on, it.label()).changed() {
+                                if on {
+                                    self.cfg.sidebar_meters.push(it);
+                                    let order = crate::config::OverlayItem::ALL;
+                                    self.cfg.sidebar_meters.sort_by_key(|x| order.iter().position(|o| *o == *x));
+                                } else {
+                                    self.cfg.sidebar_meters.retain(|x| *x != it);
+                                }
+                                self.cfg.save();
+                            }
+                        }
+                    });
                 }
             });
         });
@@ -847,13 +972,15 @@ impl App {
     fn toasts_ui(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
         let mut retry: Option<AdminOp> = None;
+        let mut undo: Option<Vec<(String, String)>> = None;
         let mut close: Option<usize> = None;
         for t in self.toasts.iter_mut() {
             if t.born == 0.0 {
                 t.born = now;
             }
         }
-        self.toasts.retain(|t| now - t.born < if t.retry.is_some() { 9.0 } else { 4.0 });
+        let life_of = |t: &Toast| if t.retry.is_some() || t.undo.is_some() { 9.0 } else { 4.0 };
+        self.toasts.retain(|t| now - t.born < life_of(t));
         if self.toasts.len() > 4 {
             let n = self.toasts.len() - 4;
             self.toasts.drain(..n);
@@ -862,7 +989,7 @@ impl App {
         let mut y = screen.bottom() - 46.0;
         for (i, t) in self.toasts.iter().enumerate().rev() {
             let age = (now - t.born) as f32;
-            let life = if t.retry.is_some() { 9.0 } else { 4.0 };
+            let life = life_of(t) as f32;
             let a = (age / 0.18).min(1.0) * ((life - age) / 0.3).clamp(0.0, 1.0);
             let id = egui::Id::unique("toast").with(t.born.to_bits());
             let resp = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(egui::pos2(screen.right() - 18.0, y + (1.0 - a) * 12.0)).pivot(egui::Align2::RIGHT_BOTTOM).show(ctx, |ui| {
@@ -877,6 +1004,12 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icon).color(col).size(16.0));
                         ui.add(egui::Label::new(RichText::new(&t.text).color(TEXT())).wrap());
+                        if let Some(u) = &t.undo {
+                            if button_sized(ui, Btn::Ghost, I::CLOCK_COUNTER_CLOCKWISE, "Undo", true, 26.0).on_hover_text("Start it again").clicked() {
+                                undo = Some(u.clone());
+                                close = Some(i);
+                            }
+                        }
                         if let Some(op) = &t.retry {
                             if button_sized(ui, Btn::Primary, I::SHIELD_CHECK, "Retry as admin", true, 26.0).clicked() {
                                 retry = Some(op.clone());
@@ -899,6 +1032,23 @@ impl App {
         }
         if let Some(op) = retry {
             self.run_admin_async(op, "Done (as administrator)".into(), None);
+        }
+        if let Some(list) = undo {
+            let mut failed = None;
+            for (exe, args) in &list {
+                if let Err(e) = win::launch_as_user(exe, args, None) {
+                    failed = Some(e);
+                }
+            }
+            match failed {
+                None => {
+                    let n = list.len();
+                    self.toast(ToastKind::Good, if n == 1 { "Started it again".to_string() } else { format!("Started {n} apps again") });
+                    self.log(LogKind::Action, format!("Undo: started {} again", list.iter().map(|(e, _)| std::path::Path::new(e).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()).collect::<Vec<_>>().join(", ")));
+                }
+                Some(e) => self.toast(ToastKind::Bad, format!("Couldn't start it again: {e}")),
+            }
+            self.ctl.refresh();
         }
         if !self.toasts.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -941,6 +1091,9 @@ impl eframe::App for App {
         if self.show_flag.swap(false, Ordering::SeqCst) {
             self.on_show(ctx);
         }
+        if let Some(p) = self.pending_locks.take() {
+            self.find_lockers(p);
+        }
         // Close button hides instead of quitting.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -973,8 +1126,9 @@ impl eframe::App for App {
                 self.cfg.window_size = Some([size.x, size.y]);
             }
         }
-        self.ctl.want_conns.store(self.visible && (self.page == Page::Network || (self.page == Page::Processes && self.selected.is_some())), Ordering::Relaxed);
-        self.latency.active.store(self.visible && self.page == Page::Network, Ordering::Relaxed);
+        self.ctl.want_conns.store(self.visible && (self.page == Page::Network || (self.page == Page::Processes && (self.selected.is_some() || crate::ui_procs::port_query(&self.search).is_some()))), Ordering::Relaxed);
+        let overlay_ping = (self.cfg.overlay && self.cfg.overlay_items.contains(&crate::config::OverlayItem::Ping)) || (self.visible && self.cfg.sidebar_meters.contains(&crate::config::OverlayItem::Ping));
+        self.latency.active.store((self.visible && self.page == Page::Network) || overlay_ping, Ordering::Relaxed);
         if self.visible {
             self.shortcuts(ctx);
         }
@@ -1003,9 +1157,10 @@ impl eframe::App for App {
         });
         self.modals(&ctx);
         self.palette_ui(&ctx);
+        self.perf_pick_ui(&ctx);
         self.toasts_ui(&ctx);
         if self.visible {
-            let ms = if self.page == Page::Performance && self.cfg.smooth_graphs { 33 } else { self.cfg.refresh_ms.max(250) };
+            let ms = if self.page == Page::Performance && self.cfg.smooth_graphs && self.perf_range == 0 { 33 } else { self.cfg.refresh_ms.max(250) };
             ctx.request_repaint_after(Duration::from_millis(ms));
         }
     }
