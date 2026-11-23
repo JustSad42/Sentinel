@@ -181,7 +181,7 @@ impl AppHist {
     }
 
     pub fn load() -> Self {
-        let apps: HashMap<String, Series> = std::fs::read(path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let apps: HashMap<String, Series> = crate::store::read("app-history").unwrap_or_default();
         let mut h = AppHist { apps, ..Default::default() };
         let oldest = (crate::win::now_unix() / 60) as u32 - KEEP_MIN;
         h.apps.retain(|_, s| {
@@ -192,14 +192,8 @@ impl AppHist {
     }
 
     pub fn save(&self) {
-        if let Ok(b) = serde_json::to_vec(&self.apps) {
-            let _ = std::fs::write(path(), b);
-        }
+        crate::store::write("app-history", &self.apps);
     }
-}
-
-fn path() -> std::path::PathBuf {
-    crate::config::data_dir().join("app-history.json")
 }
 
 /// Averages `s` into `n` buckets covering the last `range_secs`, CPU and memory (bytes); NaN = no data.

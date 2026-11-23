@@ -150,6 +150,8 @@ pub struct Config {
     pub start_with_windows: bool,
     pub hook_ctrl_shift_esc: bool,
     pub hide_on_focus_loss: bool,
+    /// How long the window may be out of focus before it hides.
+    pub hide_grace_ms: u32,
     pub confirm_end_task: bool,
     pub show_windows_group: bool,
     pub auto_update: bool,
@@ -290,6 +292,7 @@ impl Default for Config {
             start_with_windows: true,
             hook_ctrl_shift_esc: true,
             hide_on_focus_loss: false,
+            hide_grace_ms: 1500,
             confirm_end_task: false,
             show_windows_group: true,
             auto_update: true,

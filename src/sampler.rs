@@ -243,6 +243,20 @@ pub struct Control {
     pub info: Mutex<Option<Arc<crate::info::Info>>>,
     /// The mini overlay is showing (needs GPU numbers even while the window is hidden).
     pub overlay: AtomicBool,
+    /// A page that graphs the GPU is open: read GPU counters every tick instead of every third.
+    pub fast_gpu: AtomicBool,
+    /// What's on screen, so a new sample that changes nothing visible doesn't trigger a redraw.
+    pub watch: Mutex<Watch>,
+}
+
+/// Set by the UI each frame.
+#[derive(Default)]
+pub struct Watch {
+    /// The page shows live data everywhere (graphs, details): redraw on every sample.
+    pub live: bool,
+    /// Processes on screen and the columns shown for them.
+    pub keys: Vec<Key>,
+    pub cols: Vec<crate::config::Col>,
 }
 
 // ---------------------------------------------------------------- NT structures
@@ -412,6 +426,9 @@ pub struct Sampler {
     addr_cache: Vec<Adapter>,
     self_pid: u32,
     etw_tried: bool,
+    last_gpu: GpuSample,
+    last_sig: u64,
+    last_paint: Option<Instant>,
 }
 
 pub fn critical(name: &str) -> bool {
@@ -448,6 +465,9 @@ impl Sampler {
             addr_cache: Vec::new(),
             self_pid: std::process::id(),
             etw_tried: false,
+            last_gpu: GpuSample::default(),
+            last_sig: 0,
+            last_paint: None,
         };
         std::thread::Builder::new()
             .name("sampler".into())
@@ -478,10 +498,13 @@ impl Sampler {
                         win::trim_working_set();
                         last_trim = Some(Instant::now());
                     }
-                    // Hidden (and no overlay): every 2 s is plenty for rules, history and schedules.
+                    // Hidden (and no overlay): every 5 s is plenty for history, schedules and the
+                    // CPU/memory rules. Every 2 s while a rule must catch apps as they start, and
+                    // while the boot timeline is being recorded.
                     let mut ms = s.ctl.interval_ms.load(Ordering::Relaxed).clamp(250, 10_000);
                     if !s.ctl.visible.load(Ordering::Relaxed) && !s.ctl.overlay.load(Ordering::Relaxed) {
-                        ms = ms.max(2000);
+                        let quick = s.boot.recording() || s.start_rules();
+                        ms = ms.max(if quick { 2000 } else { 5000 });
                     }
                     let interval = Duration::from_millis(ms);
                     // Sleep until the next tick, or until the UI asks for a refresh (unpark).
@@ -661,12 +684,24 @@ impl Sampler {
         let (mut gpu, mut disks) = (GpuSample::default(), Vec::new());
         let overlay = self.ctl.overlay.load(Ordering::Relaxed);
         let long_tick = self.tick % 10 == 0;
-        if visible || overlay || long_tick {
+        // The GPU counters are the costliest read after the process list: while the window is open
+        // they're read every third tick (the numbers are averages over that time), except on a page
+        // that graphs them.
+        let gpu_due = overlay || long_tick || (visible && (self.ctl.fast_gpu.load(Ordering::Relaxed) || self.tick % 3 == 0));
+        let mut gpu_fresh = false;
+        if gpu_due {
             if let Some(pdh) = self.pdh.as_mut() {
                 if pdh.collect() {
                     gpu = pdh.gpu();
+                    gpu_fresh = true;
+                    self.last_gpu = gpu.clone();
                 }
             }
+        }
+        if !gpu_fresh && visible {
+            gpu = self.last_gpu.clone();
+        }
+        if gpu_fresh || visible {
             for p in procs.iter_mut() {
                 p.gpu = *gpu.per_pid.get(&p.pid).unwrap_or(&0.0);
                 p.gpu_mem = *gpu.mem_per_pid.get(&p.pid).unwrap_or(&0);
@@ -887,7 +922,7 @@ impl Sampler {
             a.n += 1;
             a.sum.cpu += cpu_total;
             a.sum.mem += if mem_total > 0 { used as f32 / mem_total as f32 * 100.0 } else { 0.0 };
-            if visible || overlay || long_tick {
+            if gpu_fresh {
                 a.gpu_n += 1;
                 a.sum.gpu += gpu.util;
             }
@@ -999,10 +1034,29 @@ impl Sampler {
         prof.mark("publish");
         prof.finish(visible);
         if visible {
-            if let Some(ctx) = self.ctl.repaint.lock().unwrap().as_ref() {
-                ctx.request_repaint();
+            // Redraw only when something on screen changed at the precision it's shown with
+            // (and at least every 5 s, for clocks and slow-moving details).
+            let sig = {
+                let sh = self.shared.lock().unwrap();
+                let w = self.ctl.watch.lock().unwrap();
+                if w.live { None } else { Some(display_sig(&sh.snap, &w)) }
+            };
+            let stale = self.last_paint.is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+            if sig.is_none() || sig != Some(self.last_sig) || stale {
+                self.last_sig = sig.unwrap_or(0);
+                self.last_paint = Some(Instant::now());
+                if let Some(ctx) = self.ctl.repaint.lock().unwrap().as_ref() {
+                    ctx.request_repaint();
+                }
             }
+        } else {
+            self.last_paint = None;
         }
+    }
+
+    /// An enabled rule that acts the moment an app starts (block, priority, cores).
+    fn start_rules(&self) -> bool {
+        self.shared.lock().unwrap().rules.iter().any(|r| r.enabled && matches!(r.action, RuleAction::Block | RuleAction::SetPriority(_) | RuleAction::SetAffinity(_)))
     }
 
     fn apply_schedules(&mut self, procs: &[Proc]) {
@@ -1198,7 +1252,7 @@ impl Sampler {
 
 pub fn load_history() -> (Vec<HistEntry>, VecDeque<LogEvent>) {
     let dir = crate::config::data_dir();
-    let mut h: Vec<HistEntry> = std::fs::read(dir.join("history.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut h: Vec<HistEntry> = crate::store::read("history").unwrap_or_default();
     let now = win::now_unix();
     for e in h.iter_mut() {
         if e.ended.is_none() {
@@ -1245,25 +1299,23 @@ pub fn average(pts: &[LongPoint], t: i64) -> Option<LongPoint> {
 
 fn load_points(file: &str, keep_secs: i64) -> VecDeque<LongPoint> {
     let cutoff = win::now_unix() - keep_secs - 3600;
-    let v: Vec<LongPoint> = std::fs::read(crate::config::data_dir().join(file)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let v: Vec<LongPoint> = crate::store::read(file).unwrap_or_default();
     v.into_iter().filter(|p| p.t >= cutoff).map(|p| LongPoint { gpu: if p.gpu < 0.0 { f32::NAN } else { p.gpu }, gpu_temp: if p.gpu_temp < 0.0 { f32::NAN } else { p.gpu_temp }, ..p }).collect()
 }
 
 fn save_points(file: &str, pts: &VecDeque<LongPoint>) {
-    // NaN isn't valid JSON: store missing GPU samples as -1.
+    // Missing GPU samples are stored as -1 (the old JSON files couldn't hold NaN).
     let v: Vec<LongPoint> = pts.iter().map(|p| LongPoint { gpu: if p.gpu.is_nan() { -1.0 } else { p.gpu }, gpu_temp: if p.gpu_temp.is_nan() { -1.0 } else { p.gpu_temp }, ..*p }).collect();
-    if let Ok(b) = serde_json::to_vec(&v) {
-        let _ = std::fs::write(crate::config::data_dir().join(file), b);
-    }
+    crate::store::write(file, &v);
 }
 
 pub fn load_long() -> VecDeque<LongPoint> {
-    load_points("long-history.json", 86400)
+    load_points("long-history", 86400)
 }
 
 /// 7-day series; on first run after updating, seeded from the 24-hour points so it isn't empty.
 pub fn load_week(long: &VecDeque<LongPoint>) -> VecDeque<LongPoint> {
-    let mut w = load_points("week-history.json", 7 * 86400);
+    let mut w = load_points("week-history", 7 * 86400);
     if w.is_empty() {
         let mut bucket: Vec<LongPoint> = Vec::new();
         let mut cur = 0;
@@ -1282,8 +1334,8 @@ pub fn load_week(long: &VecDeque<LongPoint>) -> VecDeque<LongPoint> {
 
 pub fn save_history(sh: &Shared, keep_days: u32) {
     sh.apphist.save();
-    save_points("long-history.json", &sh.long);
-    save_points("week-history.json", &sh.week);
+    save_points("long-history", &sh.long);
+    save_points("week-history", &sh.week);
     let cutoff = win::now_unix() - keep_days.max(1) as i64 * 86400;
     let mut list: Vec<&HistEntry> = sh.history.iter().filter(|e| e.ended.unwrap_or(i64::MAX) >= cutoff).collect();
     if list.len() > 30_000 {
@@ -1291,9 +1343,7 @@ pub fn save_history(sh: &Shared, keep_days: u32) {
         list.drain(..n);
     }
     let dir = crate::config::data_dir();
-    if let Ok(b) = serde_json::to_vec(&list) {
-        let _ = std::fs::write(dir.join("history.json"), b);
-    }
+    crate::store::write("history", &list);
     let log: Vec<&LogEvent> = sh.log.iter().filter(|e| e.time >= cutoff).collect();
     if let Ok(b) = serde_json::to_vec(&log) {
         let _ = std::fs::write(dir.join("activity.json"), b);
@@ -1350,4 +1400,53 @@ impl Prof {
         }
         *a = (0, Vec::new());
     }
+}
+
+/// Hash of what the visible page shows, formatted the way it's shown.
+fn display_sig(snap: &Snapshot, w: &Watch) -> u64 {
+    use crate::config::Col;
+    use crate::fmt;
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let used = snap.mem_total.saturating_sub(snap.mem_avail);
+    let mem_pct = used as f64 / snap.mem_total.max(1) as f64 * 100.0;
+    // Sidebar meters and table header totals.
+    fmt::pct(snap.cpu_total).hash(&mut h);
+    format!("{mem_pct:.0}").hash(&mut h);
+    fmt::pct(snap.gpu.util).hash(&mut h);
+    fmt::bytes(snap.gpu.dedicated_used).hash(&mut h);
+    (snap.disks.iter().map(|d| d.active).fold(0.0, f32::max).round() as i32).hash(&mut h);
+    fmt::bits(snap.net_recv).hash(&mut h);
+    fmt::bits(snap.net_send).hash(&mut h);
+    fmt::rate(snap.procs.iter().map(|p| p.io_rate).sum::<f64>()).hash(&mut h);
+    snap.extra.cpu_mhz.hash(&mut h);
+    snap.extra.gpu.temperature.map(|t| t.round() as i32).hash(&mut h);
+    // Which processes exist and which have windows (grouping, counts).
+    snap.procs.len().hash(&mut h);
+    snap.procs.iter().fold(0u64, |a, p| a ^ (p.pid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ p.window.as_ref().map_or(0, |w| 1 + w.hung as u64)).hash(&mut h);
+    if !w.keys.is_empty() {
+        let by_key: HashMap<Key, &Proc> = snap.procs.iter().map(|p| (p.key(), p)).collect();
+        for k in &w.keys {
+            let Some(p) = by_key.get(k) else {
+                0u8.hash(&mut h);
+                continue;
+            };
+            for c in &w.cols {
+                match c {
+                    Col::Cpu => fmt::pct(p.cpu).hash(&mut h),
+                    Col::Memory => fmt::bytes(p.mem).hash(&mut h),
+                    Col::Disk => fmt::rate(p.io_rate).hash(&mut h),
+                    Col::Network => fmt::rate(p.net_rate()).hash(&mut h),
+                    Col::Gpu => fmt::pct(p.gpu).hash(&mut h),
+                    Col::GpuMem => fmt::bytes(p.gpu_mem).hash(&mut h),
+                    Col::Threads => p.threads.hash(&mut h),
+                    Col::Handles => p.handles.hash(&mut h),
+                    Col::Conns => p.conns.hash(&mut h),
+                    Col::Status => (p.suspended, p.window.as_ref().is_some_and(|w| w.hung)).hash(&mut h),
+                    _ => {}
+                }
+            }
+        }
+    }
+    h.finish()
 }

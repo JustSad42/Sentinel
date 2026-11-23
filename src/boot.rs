@@ -64,6 +64,9 @@ pub struct BootRecord {
     /// When CPU use first stayed low for 10 s after the desktop appeared.
     pub settled_secs: Option<f32>,
     pub apps: Vec<AppImpact>,
+    /// System load over the first minutes: (seconds, CPU %, disk bytes/s), about every 2 s.
+    #[serde(default)]
+    pub curve: Vec<[f32; 3]>,
 }
 
 impl BootRecord {
@@ -119,6 +122,11 @@ pub struct Tracker {
 }
 
 impl Tracker {
+    /// Still watching this session's startup.
+    pub fn recording(&self) -> bool {
+        !self.done
+    }
+
     pub fn sample(&mut self, procs: &[Proc], cpu_total: f32) {
         if self.done {
             return;
@@ -174,6 +182,12 @@ impl Tracker {
                 e.3 = p.cpu_time / 10_000;
                 e.4 = p.io_total;
             }
+        }
+
+        // Load curve for the chart.
+        if rec.curve.last().is_none_or(|l| elapsed as f32 - l[0] >= 1.9) {
+            let disk = procs.iter().map(|p| p.io_rate).sum::<f64>() as f32;
+            rec.curve.push([elapsed as f32, cpu_total, disk]);
         }
 
         // Settled: CPU under 15% for 10 s once the desktop is up.

@@ -4,6 +4,7 @@
 mod actions;
 mod admin;
 mod app;
+mod store;
 mod apphist;
 mod apps;
 mod boot;

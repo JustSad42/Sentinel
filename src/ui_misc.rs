@@ -1087,12 +1087,25 @@ impl App {
                 });
                 ui.separator();
                 let mut v = self.cfg.hide_on_focus_loss;
-                setting_row(ui, "Hide when I click away", "Like a quick-look panel: Sentinel hides itself as soon as another window gets focus.", |ui| {
+                setting_row(ui, "Hide when I click away", "Like a quick-look panel: Sentinel hides itself when another window keeps focus.", |ui| {
                     if toggle_widget(ui, &mut v).changed() {
                         self.cfg.hide_on_focus_loss = v;
                         self.cfg.save();
                     }
                 });
+                if self.cfg.hide_on_focus_loss {
+                    setting_row(ui, "Wait before hiding", "So a dialog or another window grabbing focus for a moment doesn't hide Sentinel.", |ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            for (ms, label) in [(3000u32, "3 s"), (2000, "2 s"), (1500, "1.5 s"), (1000, "1 s"), (500, "0.5 s"), (0, "At once")] {
+                                let mut on = self.cfg.hide_grace_ms == ms;
+                                if chip(ui, &mut on, label, None).clicked() {
+                                    self.cfg.hide_grace_ms = ms;
+                                    self.cfg.save();
+                                }
+                            }
+                        });
+                    });
+                }
                 ui.separator();
                 let mut v = self.cfg.confirm_end_task;
                 setting_row(ui, "Confirm before ending a task", "Critical system processes and multi-process kills always ask.", |ui| {
@@ -1530,6 +1543,48 @@ impl App {
                 });
             });
             ui.add_space(8.0);
+            // Load chart: CPU (filled) and disk (line) over the same time axis as the timeline below.
+            let curve: Vec<[f32; 3]> = boot.curve.iter().filter(|c| c[0] <= total).copied().collect();
+            if curve.len() >= 3 {
+                let (cr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 90.0), Sense::hover());
+                let x_of = |s: f32| cr.left() + 8.0 + (cr.width() - 16.0) * (s / total).clamp(0.0, 1.0);
+                let (top, bottom) = (cr.top() + 20.0, cr.bottom() - 2.0);
+                let y_cpu = |v: f32| bottom - (bottom - top) * (v / 100.0).clamp(0.0, 1.0);
+                let disk_max = curve.iter().map(|c| c[2]).fold(1.0, f32::max);
+                let y_disk = |v: f32| bottom - (bottom - top) * (v / disk_max).clamp(0.0, 1.0);
+                let p = ui.painter();
+                for frac in [0.5f32, 1.0] {
+                    let y = y_cpu(frac * 100.0);
+                    p.line_segment([egui::pos2(cr.left() + 8.0, y), egui::pos2(cr.right() - 8.0, y)], Stroke::new(1.0, BORDER().gamma_multiply(0.6)));
+                }
+                p.line_segment([egui::pos2(cr.left() + 8.0, bottom), egui::pos2(cr.right() - 8.0, bottom)], Stroke::new(1.0, BORDER()));
+                // CPU area, one quad per segment.
+                let fill = C_CPU().gamma_multiply(0.22);
+                for w in curve.windows(2) {
+                    let (x0, x1) = (x_of(w[0][0]), x_of(w[1][0]));
+                    let pts = vec![egui::pos2(x0, bottom), egui::pos2(x0, y_cpu(w[0][1])), egui::pos2(x1, y_cpu(w[1][1])), egui::pos2(x1, bottom)];
+                    p.add(egui::Shape::convex_polygon(pts, fill, Stroke::NONE));
+                }
+                let cpu_line: Vec<egui::Pos2> = curve.iter().map(|c| egui::pos2(x_of(c[0]), y_cpu(c[1]))).collect();
+                p.add(egui::Shape::line(cpu_line, Stroke::new(1.6, C_CPU())));
+                let disk_line: Vec<egui::Pos2> = curve.iter().map(|c| egui::pos2(x_of(c[0]), y_disk(c[2]))).collect();
+                p.add(egui::Shape::line(disk_line, Stroke::new(1.2, C_DISK().gamma_multiply(0.8))));
+                p.text(egui::pos2(cr.left() + 10.0, cr.top()), egui::Align2::LEFT_TOP, "CPU", egui::FontId::proportional(10.5), C_CPU());
+                p.text(egui::pos2(cr.left() + 44.0, cr.top()), egui::Align2::LEFT_TOP, format!("Disk (peak {})", fmt::rate(disk_max as f64)), egui::FontId::proportional(10.5), C_DISK());
+                if let Some(pos) = resp.hover_pos() {
+                    let t = ((pos.x - cr.left() - 8.0) / (cr.width() - 16.0)).clamp(0.0, 1.0) * total;
+                    if let Some(c) = curve.iter().min_by(|a, b| (a[0] - t).abs().total_cmp(&(b[0] - t).abs())) {
+                        let x = x_of(c[0]);
+                        ui.painter().line_segment([egui::pos2(x, top), egui::pos2(x, bottom)], Stroke::new(1.0, MUTED()));
+                        let near: Vec<&str> = marks.iter().filter(|m| (m.0.start_secs - c[0]).abs() <= total / 40.0).map(|m| m.1.as_str()).take(4).collect();
+                        let mut tip = format!("{:.0} s  ·  CPU {}  ·  disk {}", c[0], fmt::pct(c[1]), fmt::rate(c[2] as f64));
+                        if !near.is_empty() {
+                            tip += &format!("\nStarting: {}", near.join(", "));
+                        }
+                        resp.on_hover_text_at_pointer(tip);
+                    }
+                }
+            }
             // Timeline
             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
             let x_of = |s: f32| rect.left() + 8.0 + (rect.width() - 16.0) * (s / total).clamp(0.0, 1.0);
@@ -1562,6 +1617,64 @@ impl App {
                 ui.painter().circle(center, r, c, Stroke::new(1.5, CARD()));
                 let hit = egui::Rect::from_center_size(center, vec2(14.0, 14.0));
                 ui.interact(hit, ui.scope_id().with(("bootmark", i)), Sense::hover()).on_hover_text(format!("{name}\nStarted at {:.0} s  ·  {} impact\nCPU {:.1} s  ·  disk {}", a.start_secs, a.label(), a.cpu_ms as f64 / 1000.0, fmt::bytes(a.io_bytes)));
+            }
+            if marks.is_empty() {
+                return;
+            }
+            // What each startup app cost, heaviest first.
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("What each startup app cost").font(bold(13.0)));
+                ui.label(RichText::new("CPU time and disk use in each app's first 2 minutes").size(11.5).color(FAINT()));
+            });
+            ui.add_space(4.0);
+            let mut cost = marks.clone();
+            cost.sort_by(|a, b| b.0.cpu_ms.cmp(&a.0.cpu_ms).then(b.0.io_bytes.cmp(&a.0.io_bytes)));
+            let max_cpu = cost.first().map(|c| c.0.cpu_ms).unwrap_or(1).max(1) as f32;
+            let max_io = cost.iter().map(|c| c.0.io_bytes).max().unwrap_or(1).max(1) as f32;
+            let all_id = ui.scope_id().with("boot-cost-all");
+            let show_all = ui.ctx().data(|d| d.get_temp::<bool>(all_id)).unwrap_or(false);
+            let n = if show_all { cost.len() } else { cost.len().min(8) };
+            for (a, name) in cost.iter().take(n) {
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+                let p = ui.painter();
+                if resp.hovered() {
+                    p.rect_filled(r, CornerRadius::same(5), FIELD());
+                }
+                let c = match a.level() {
+                    crate::boot::Impact::High => BAD(),
+                    crate::boot::Impact::Medium => WARN(),
+                    crate::boot::Impact::Low => GOOD(),
+                };
+                let cy = r.center().y;
+                p.circle_filled(egui::pos2(r.left() + 10.0, cy), 4.0, c);
+                let name_w = (r.width() * 0.34).max(120.0);
+                let galley = ui.painter().layout(name.clone(), egui::FontId::proportional(13.0), TEXT(), f32::INFINITY);
+                let clip = egui::Rect::from_min_max(egui::pos2(r.left() + 22.0, r.top()), egui::pos2(r.left() + 22.0 + name_w - 8.0, r.bottom()));
+                ui.painter().with_clip_rect(clip).galley(egui::pos2(clip.left(), cy - galley.size().y / 2.0), galley, TEXT());
+                let p = ui.painter();
+                let x0 = r.left() + 22.0 + name_w;
+                p.text(egui::pos2(x0, cy), egui::Align2::LEFT_CENTER, format!("at {:.0} s", a.start_secs), egui::FontId::proportional(11.5), FAINT());
+                // Two bars: CPU time and disk, each scaled to the heaviest app.
+                let bars_l = x0 + 64.0;
+                let bars_w = ((r.right() - 8.0) - bars_l).max(80.0);
+                let half = bars_w / 2.0 - 8.0;
+                let bar = |p: &egui::Painter, left: f32, frac: f32, color: Color32, text: String| {
+                    let track = egui::Rect::from_min_size(egui::pos2(left, cy - 3.0), vec2(half * 0.55, 6.0));
+                    p.rect_filled(track, CornerRadius::same(3), BORDER().gamma_multiply(0.5));
+                    let fill = egui::Rect::from_min_size(track.min, vec2((track.width() * frac.clamp(0.0, 1.0)).max(2.0), 6.0));
+                    p.rect_filled(fill, CornerRadius::same(3), color);
+                    p.text(egui::pos2(track.right() + 8.0, cy), egui::Align2::LEFT_CENTER, text, egui::FontId::proportional(11.5), MUTED());
+                };
+                bar(p, bars_l, a.cpu_ms as f32 / max_cpu, C_CPU(), format!("{:.1} s CPU", a.cpu_ms as f64 / 1000.0));
+                bar(p, bars_l + half + 16.0, a.io_bytes as f32 / max_io, C_DISK(), format!("{} disk", fmt::bytes(a.io_bytes)));
+                resp.on_hover_text(format!("{name}\n{} impact  ·  {} process{}{}", a.label(), a.processes, if a.processes == 1 { "" } else { "es" }, if a.exact { "" } else { "\nSentinel started after this app's first 2 minutes, so the numbers run high." }));
+            }
+            if cost.len() > 8 {
+                let label = if show_all { "Show fewer".to_string() } else { format!("Show all {}", cost.len()) };
+                if ui.add(egui::Button::new(RichText::new(label).size(12.0).color(ACCENT_HI())).frame(false)).clicked() {
+                    ui.ctx().data_mut(|d| d.insert_temp(all_id, !show_all));
+                }
             }
         });
     }

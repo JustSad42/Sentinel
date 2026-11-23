@@ -637,6 +637,7 @@ impl App {
             }
             let sort_col = self.cfg.sort_col;
             let sort_desc = self.cfg.sort_desc;
+            self.on_screen.clear();
             let sums = (snap.cpu_total, snap.mem_total - snap.mem_avail, snap.procs.iter().map(|p| p.io_rate).sum::<f64>(), snap.net_send + snap.net_recv, snap.gpu.util);
             tb.header(46.0, |mut h| {
                 h.col(|ui| {
@@ -684,6 +685,7 @@ impl App {
                             }
                         }
                         Row::Group { key, members, agg, expanded } => {
+                            self.on_screen.extend(members.iter().map(|&i| snap.procs[i].key()));
                             let first = &snap.procs[members[0]];
                             row.set_selected(self.sel_group.as_deref() == Some(key.as_str()));
                             let mut caret_hit = 0.0;
@@ -736,6 +738,7 @@ impl App {
                         }
                         Row::Proc { idx, depth, expander } => {
                             let p = &snap.procs[*idx];
+                            self.on_screen.push(p.key());
                             row.set_selected(self.selected == Some(p.key()) && self.sel_group.is_none());
                             let mut caret_hit = 0.0;
                             row.col(|ui| {
@@ -1645,13 +1648,17 @@ struct Usage {
     gpu: f32,
 }
 
+/// GPU % below which a process shows no GPU number.
+const GPU_SHOW: f32 = 1.0;
+
 impl Usage {
     fn cell(&self, ui: &mut Ui, c: Col, total_mem: f64, per_app_net: bool) {
         const MB: f64 = 1048576.0;
         // (text, load 0..1 for the bar, severity 0..1 for color, idle?)
         let (text, load, sev, idle, color) = match c {
             Col::Cpu => (fmt::pct(self.cpu), self.cpu / 100.0, self.cpu / 60.0, self.cpu < 0.05, C_CPU()),
-            Col::Gpu => (fmt::pct(self.gpu), self.gpu / 100.0, self.gpu / 70.0, self.gpu < 0.05, C_GPU()),
+            // Only apps that use a noticeable share of the GPU get a number; the rest stay blank.
+            Col::Gpu => (if self.gpu < GPU_SHOW { String::new() } else { fmt::pct(self.gpu) }, self.gpu / 100.0, self.gpu / 70.0, self.gpu < GPU_SHOW, C_GPU()),
             Col::Memory => {
                 let share = (self.mem as f64 / total_mem) as f32;
                 // Relative to installed RAM: amber from ~7.5%, red from ~15% of memory.

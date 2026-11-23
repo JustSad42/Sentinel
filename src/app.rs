@@ -126,6 +126,10 @@ pub struct App {
     shown_at: Instant,
     hidden_at: Instant,
     had_focus: bool,
+    /// When the window lost focus (for the auto-hide grace period).
+    unfocused_since: Option<Instant>,
+    /// Processes drawn in the table this frame (the sampler skips redraws when none of them change).
+    pub on_screen: Vec<crate::sampler::Key>,
     /// Started hidden: the window is cloaked until eframe's first paint (which force-shows it) is undone.
     start_cloaked: bool,
     /// (opacity, click-through) last applied to the overlay window.
@@ -236,6 +240,8 @@ impl App {
             refresh_now: false.into(),
             want_conns: false.into(),
             overlay: false.into(),
+            fast_gpu: false.into(),
+            watch: Default::default(),
             repaint: Mutex::new(Some(cc.egui_ctx.clone())),
             info: Mutex::new(None),
         });
@@ -322,6 +328,8 @@ impl App {
             shown_at: Instant::now(),
             hidden_at: Instant::now(),
             had_focus: false,
+            unfocused_since: None,
+            on_screen: Vec::new(),
             start_cloaked: start_hidden && win::set_cloaked(hwnd, true),
             overlay_style: (1.0, false),
             pending_select: cfg.last_selected.clone(),
@@ -692,6 +700,7 @@ impl App {
         self.visible = true;
         self.shown_at = Instant::now();
         self.had_focus = false;
+        self.unfocused_since = None;
         if std::mem::take(&mut self.start_cloaked) {
             win::set_cloaked(self.hwnd, false);
         }
@@ -1140,8 +1149,18 @@ impl eframe::App for App {
             }
             // Only hide on focus loss after the window really had focus since it was shown; the focus
             // state right after showing is stale (it still says "not focused" from while hidden).
-            if self.cfg.hide_on_focus_loss && self.modal.is_none() && self.had_focus && !focused && self.shown_at.elapsed() > Duration::from_millis(1200) {
-                self.hide(ctx);
+            // Then wait the grace period, so a dialog or tooltip grabbing focus briefly doesn't hide it.
+            if focused || !self.had_focus {
+                self.unfocused_since = None;
+            } else if self.cfg.hide_on_focus_loss && self.modal.is_none() && self.shown_at.elapsed() > Duration::from_millis(1200) {
+                let since = *self.unfocused_since.get_or_insert_with(Instant::now);
+                let grace = Duration::from_millis(self.cfg.hide_grace_ms as u64);
+                if since.elapsed() >= grace {
+                    self.unfocused_since = None;
+                    self.hide(ctx);
+                } else {
+                    ctx.request_repaint_after(grace - since.elapsed());
+                }
             }
         }
         if !self.paused {
@@ -1197,10 +1216,26 @@ impl eframe::App for App {
         self.modals(&ctx);
         self.palette_ui(&ctx);
         self.perf_pick_ui(&ctx);
+        // Tell the sampler what's on screen so it only asks for a redraw when that changes.
+        {
+            let live = self.modal.is_some()
+                || self.palette.open
+                || match self.page {
+                    Page::Processes => self.selected.is_some() || self.sel_group.is_some(),
+                    Page::Apps | Page::Startup | Page::Services | Page::Settings => false,
+                    _ => true,
+                };
+            let mut w = self.ctl.watch.lock().unwrap();
+            w.live = live;
+            w.keys = if self.page == Page::Processes { std::mem::take(&mut self.on_screen) } else { Vec::new() };
+            w.cols = self.cfg.columns.clone();
+            self.ctl.fast_gpu.store(self.page == Page::Performance, Ordering::Relaxed);
+        }
         self.toasts_ui(&ctx);
-        if self.visible {
-            let ms = if self.page == Page::Performance && self.cfg.smooth_graphs && self.perf_range == 0 { 33 } else { self.cfg.refresh_ms.max(250) };
-            ctx.request_repaint_after(Duration::from_millis(ms));
+        // Smooth scrolling graphs need frames between samples; everything else redraws when the
+        // sampler says something on screen changed.
+        if self.visible && self.page == Page::Performance && self.cfg.smooth_graphs && self.perf_range == 0 {
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
     }
 
