@@ -562,3 +562,12 @@ pub fn trim_working_set() {
     }
 }
 
+
+/// Cloaks or uncloaks a window (kept out of view by DWM even while "visible"). True on success.
+pub fn set_cloaked(hwnd: isize, on: bool) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let v: i32 = on as i32;
+    unsafe { windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(hwnd as _, 13, &v as *const _ as *const _, 4) == 0 }
+}

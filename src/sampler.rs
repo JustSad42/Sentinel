@@ -506,6 +506,7 @@ impl Sampler {
         self.prev_at = Some(now);
         self.tick += 1;
         let visible = self.ctl.visible.load(Ordering::Relaxed);
+        let mut prof = Prof::start();
         if visible && !self.etw_tried {
             self.etw_tried = true;
             if win::is_elevated() {
@@ -517,7 +518,9 @@ impl Sampler {
         let mut procs: Vec<Proc> = Vec::with_capacity(400);
         let mut thread_count = 0u32;
         let mut handle_count = 0u32;
-        if query_system(5, &mut self.buf) {
+        let got = query_system(5, &mut self.buf);
+        prof.mark("ntquery");
+        if got {
             let mut off = 0usize;
             loop {
                 let p = unsafe { &*(self.buf.as_ptr().add(off) as *const SystemProcessInformation) };
@@ -566,6 +569,7 @@ impl Sampler {
                 off += p.next_entry_offset as usize;
             }
         }
+        prof.mark("procs");
         let proc_count = procs.len() as u32;
 
         // --- per-core CPU
@@ -597,6 +601,7 @@ impl Sampler {
             self.prev_cores = cur;
         }
         let cpu_total = if tot_all > 0.0 { (tot_busy / tot_all * 100.0) as f32 } else { 0.0 };
+        prof.mark("cores");
         let cpu_kernel = if tot_all > 0.0 { (tot_kern / tot_all * 100.0) as f32 } else { 0.0 };
 
         // --- per-process rates
@@ -618,6 +623,7 @@ impl Sampler {
         // Scale so the per-process sum matches the system total (sampling skew).
         let _ = cpu_total;
 
+        prof.mark("rates");
         // --- windows (apps, hung detection)
         let wins = top_windows();
         for p in procs.iter_mut() {
@@ -626,6 +632,7 @@ impl Sampler {
             }
         }
 
+        prof.mark("windows");
         // --- memory
         let (mut mem_total, mut mem_avail, mut commit_total, mut commit_limit, mut cache, mut paged, mut nonpaged) = (0, 0, 0, 0, 0, 0, 0);
         unsafe {
@@ -649,6 +656,7 @@ impl Sampler {
             }
         }
 
+        prof.mark("memory");
         // --- GPU & disks (counters are comparatively expensive: only while visible)
         let (mut gpu, mut disks) = (GpuSample::default(), Vec::new());
         let overlay = self.ctl.overlay.load(Ordering::Relaxed);
@@ -665,10 +673,12 @@ impl Sampler {
             }
         }
 
+        prof.mark("gpu");
         if let Some(d) = self.disk_io.as_mut() {
             disks = d.sample();
         }
 
+        prof.mark("disks");
         // --- network
         let mut adapters = net::adapters();
         if self.tick % 10 == 1 || self.addr_cache.len() != adapters.len() {
@@ -697,9 +707,11 @@ impl Sampler {
         }
         self.prev_adapters = seen_if;
 
+        prof.mark("net");
         let etw = net::etw_drain();
         let per_app_net = net::etw_running();
-        let want_conns = visible && (self.ctl.want_conns.load(Ordering::Relaxed) || self.tick % 3 == 0);
+        // Socket tables are the most expensive read here: only when something on screen shows them.
+        let want_conns = visible && self.ctl.want_conns.load(Ordering::Relaxed);
         let mut conns = if visible && (want_conns || per_app_net) { net::connections() } else { Vec::new() };
         if !conns.is_empty() {
             let mut counts: HashMap<u32, u32> = HashMap::new();
@@ -748,6 +760,7 @@ impl Sampler {
             }
         }
 
+        prof.mark("conns");
         // --- services (pid -> names), refreshed every few seconds while visible
         if visible && (self.tick % 8 == 1 || self.services.is_empty()) {
             let mut m: HashMap<u32, Vec<(String, String)>> = HashMap::new();
@@ -759,20 +772,25 @@ impl Sampler {
             self.services = Arc::new(m);
         }
 
+        prof.mark("services");
         // --- rules
         self.apply_rules(&procs, elapsed as f32);
 
+        prof.mark("rules");
         // --- deeper kernel / hardware counters
         let extra = self.hw.sample(elapsed, visible || overlay || long_tick, self.tick, (tot_intr, tot_dpc, tot_irq, tot_all));
 
+        prof.mark("hw");
         if let Some((_, ac)) = extra.battery {
             self.on_battery = !ac;
         }
         self.apply_schedules(&procs);
 
+        prof.mark("sched");
         // --- boot timeline / startup impact (first minutes of the session only)
         self.boot.sample(&procs, cpu_total);
 
+        prof.mark("boot");
         // --- warm metadata + icons
         let info = self.ctl.info.lock().unwrap().clone();
         if let Some(info) = info {
@@ -807,6 +825,7 @@ impl Sampler {
             }
         }
 
+        prof.mark("warm");
         // --- publish
         let mut sh = self.shared.lock().unwrap();
         // history
@@ -977,6 +996,8 @@ impl Sampler {
             extra,
         });
         drop(sh);
+        prof.mark("publish");
+        prof.finish(visible);
         if visible {
             if let Some(ctx) = self.ctl.repaint.lock().unwrap().as_ref() {
                 ctx.request_repaint();
@@ -1276,5 +1297,57 @@ pub fn save_history(sh: &Shared, keep_days: u32) {
     let log: Vec<&LogEvent> = sh.log.iter().filter(|e| e.time >= cutoff).collect();
     if let Ok(b) = serde_json::to_vec(&log) {
         let _ = std::fs::write(dir.join("activity.json"), b);
+    }
+}
+
+/// Per-stage sampler timings, written to profile.log every 30 ticks when SENTINEL_PROFILE is set.
+struct Prof {
+    on: bool,
+    last: Instant,
+}
+
+static PROF_ACC: Mutex<(u32, Vec<(&'static str, f64, f64)>)> = Mutex::new((0, Vec::new()));
+
+impl Prof {
+    fn start() -> Self {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        Prof { on: *ON.get_or_init(|| std::env::var_os("SENTINEL_PROFILE").is_some()), last: Instant::now() }
+    }
+    fn mark(&mut self, name: &'static str) {
+        if !self.on {
+            return;
+        }
+        let ms = self.last.elapsed().as_secs_f64() * 1000.0;
+        self.last = Instant::now();
+        let mut a = PROF_ACC.lock().unwrap();
+        match a.1.iter_mut().find(|(n, _, _)| *n == name) {
+            Some(e) => {
+                e.1 += ms;
+                e.2 = e.2.max(ms);
+            }
+            None => a.1.push((name, ms, ms)),
+        }
+    }
+    fn finish(&mut self, visible: bool) {
+        if !self.on {
+            return;
+        }
+        let mut a = PROF_ACC.lock().unwrap();
+        a.0 += 1;
+        if a.0 < 30 {
+            return;
+        }
+        let n = a.0 as f64;
+        let total: f64 = a.1.iter().map(|e| e.1).sum::<f64>() / n;
+        let mut line = format!("{} visible={visible} total={total:.2}ms", crate::win::now_unix());
+        for (k, v, m) in &a.1 {
+            line += &format!(" {k}={:.2}/{m:.1}", v / n);
+        }
+        line.push(10 as char);
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crate::config::data_dir().join("profile.log")) {
+            let _ = f.write_all(line.as_bytes());
+        }
+        *a = (0, Vec::new());
     }
 }

@@ -126,6 +126,8 @@ pub struct App {
     shown_at: Instant,
     hidden_at: Instant,
     had_focus: bool,
+    /// Started hidden: the window is cloaked until eframe's first paint (which force-shows it) is undone.
+    start_cloaked: bool,
     /// (opacity, click-through) last applied to the overlay window.
     pub overlay_style: (f32, bool),
     /// Exe name to re-select once its process shows up (selection survives restarts).
@@ -320,6 +322,7 @@ impl App {
             shown_at: Instant::now(),
             hidden_at: Instant::now(),
             had_focus: false,
+            start_cloaked: start_hidden && win::set_cloaked(hwnd, true),
             overlay_style: (1.0, false),
             pending_select: cfg.last_selected.clone(),
             pending_locks: integration::take_locks_request(),
@@ -689,6 +692,9 @@ impl App {
         self.visible = true;
         self.shown_at = Instant::now();
         self.had_focus = false;
+        if std::mem::take(&mut self.start_cloaked) {
+            win::set_cloaked(self.hwnd, false);
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         self.ctl.visible.store(true, Ordering::Relaxed);
         self.ctl.refresh();
@@ -1112,7 +1118,19 @@ impl eframe::App for App {
         }
         // Safety net: the window is on screen (shown by Windows directly, e.g. by the show listener)
         // but we think it's hidden, which would leave it blank. Treat it as shown.
-        if !self.visible && !self.quit && self.hidden_at.elapsed() > Duration::from_millis(800) && win::is_window_visible(self.hwnd as _) {
+        // eframe shows the window after its first paint even when it was created hidden. Undo that
+        // while it's still cloaked (so nothing flashes), then uncloak for later shows.
+        if self.start_cloaked && !self.visible && ctx.cumulative_frame_nr() >= 1 {
+            if win::is_window_visible(self.hwnd as _) {
+                win::hide_window(self.hwnd as _);
+            }
+            win::set_cloaked(self.hwnd, false);
+            self.start_cloaked = false;
+            self.hidden_at = Instant::now();
+        } else if self.start_cloaked && !self.visible {
+            ctx.request_repaint();
+        }
+        if !self.start_cloaked && !self.visible && !self.quit && self.hidden_at.elapsed() > Duration::from_millis(800) && win::is_window_visible(self.hwnd as _) {
             self.on_show(ctx);
         }
         if self.visible {
@@ -1147,7 +1165,7 @@ impl eframe::App for App {
                 self.cfg.window_size = Some([size.x, size.y]);
             }
         }
-        self.ctl.want_conns.store(self.visible && (self.page == Page::Network || (self.page == Page::Processes && (self.selected.is_some() || crate::ui_procs::port_query(&self.search).is_some()))), Ordering::Relaxed);
+        self.ctl.want_conns.store(self.visible && (self.page == Page::Network || (self.page == Page::Processes && (self.selected.is_some() || self.cfg.columns.contains(&crate::config::Col::Conns) || crate::ui_procs::port_query(&self.search).is_some()))), Ordering::Relaxed);
         let overlay_ping = (self.cfg.overlay && self.cfg.overlay_items.contains(&crate::config::OverlayItem::Ping)) || (self.visible && self.cfg.sidebar_meters.contains(&crate::config::OverlayItem::Ping));
         self.latency.active.store((self.visible && self.page == Page::Network) || overlay_ping, Ordering::Relaxed);
         if self.visible {
