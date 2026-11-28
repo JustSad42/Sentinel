@@ -284,7 +284,19 @@ impl App {
             let exe = integration::exe_path();
             let at_logon = cfg.start_with_windows;
             std::thread::spawn(move || {
-                let _ = admin::ensure_task(&exe, at_logon);
+                if crate::install::is_protected(&exe) {
+                    let _ = admin::ensure_task(&exe, at_logon);
+                    // Repoint a Task Manager redirect that still names an older copy.
+                    if admin::ifeo_enabled() {
+                        let _ = admin::run(AdminOp::Ifeo { enable: true, exe });
+                    }
+                } else {
+                    // Couldn't install: leave nothing that would run this copy as admin unasked.
+                    admin::delete_task();
+                    if admin::ifeo_enabled() {
+                        let _ = admin::run(AdminOp::Ifeo { enable: false, exe });
+                    }
+                }
                 // Older builds used the Run key, which can't start elevated apps.
                 let _ = integration::set_autostart(false);
             });
@@ -961,7 +973,7 @@ impl App {
 
     fn update_banner(&mut self, ui: &mut Ui) {
         let st = self.update.lock().unwrap().clone();
-        if let updater::State::Ready { version, path, .. } = st {
+        if let updater::State::Ready { version, exe, .. } = st {
             egui::Frame::new().fill(ACCENT_DIM()).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(I::SPARKLE).color(ACCENT_HI()).size(16.0));
@@ -969,7 +981,7 @@ impl App {
                     ui.label(RichText::new("It installs automatically next time the window is hidden.").color(MUTED()).size(12.5));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if button_sized(ui, Btn::Primary, I::ARROWS_CLOCKWISE, "Restart now", true, 28.0).clicked() {
-                            self.apply_update(ui.ctx(), &path, true);
+                            self.apply_update(ui.ctx(), &exe, true);
                         }
                     });
                 });
@@ -978,9 +990,9 @@ impl App {
         }
     }
 
-    pub fn apply_update(&mut self, ctx: &egui::Context, path: &std::path::Path, show: bool) {
+    pub fn apply_update(&mut self, ctx: &egui::Context, exe: &[u8], show: bool) {
         self.save_all();
-        match updater::apply(path, show) {
+        match updater::apply(exe, show) {
             Ok(()) => {
                 let inst = self.instance.take();
                 drop(inst);
@@ -1175,8 +1187,8 @@ impl eframe::App for App {
         // Silent update while nobody is looking.
         if !self.visible && self.cfg.auto_update {
             let st = self.update.lock().unwrap().clone();
-            if let updater::State::Ready { path, .. } = st {
-                self.apply_update(ctx, &path, false);
+            if let updater::State::Ready { exe, .. } = st {
+                self.apply_update(ctx, &exe, false);
             }
         }
         if let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) {

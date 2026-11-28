@@ -336,7 +336,47 @@ pub fn data_dir() -> PathBuf {
     d
 }
 
+/// Rules and schedules make the elevated app end, block and start things, so the installed copy
+/// keeps them where only elevated programs can write: beside its exe. The rest stays in %APPDATA%.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Automation {
+    rules: Vec<Rule>,
+    schedules: Vec<Schedule>,
+}
+
+fn automation_file() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    (!test_mode() && crate::install::is_protected(&exe.to_string_lossy())).then(|| exe.with_file_name("automation.json"))
+}
+
+fn write_json<T: Serialize>(path: &std::path::Path, value: &T) {
+    if let Ok(b) = serde_json::to_vec_pretty(value) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, b).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
 impl Config {
+    /// Takes rules and schedules from `file`. A missing file is created from what we have (the
+    /// first start after installing); an unreadable one means none, never the user-writable copy.
+    fn apply_automation(&mut self, file: &std::path::Path) {
+        match std::fs::read(file) {
+            Ok(bytes) => {
+                let a: Automation = serde_json::from_slice(&bytes).unwrap_or_default();
+                (self.rules, self.schedules) = (a.rules, a.schedules);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.save_automation(file),
+            Err(_) => (self.rules, self.schedules) = Default::default(),
+        }
+    }
+
+    fn save_automation(&self, file: &std::path::Path) {
+        write_json(file, &Automation { rules: self.rules.clone(), schedules: self.schedules.clone() });
+    }
+
     pub fn load() -> Self {
         let mut c: Self = std::fs::read(data_dir().join("config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         // Single-user PC: the User column is gone (kept in the enum so old configs still parse).
@@ -351,15 +391,15 @@ impl Config {
         if c.sort_col == Some(Col::User) {
             c.sort_col = Some(Col::Cpu);
         }
+        if let Some(file) = automation_file() {
+            c.apply_automation(&file);
+        }
         c
     }
     pub fn save(&self) {
-        if let Ok(b) = serde_json::to_vec_pretty(self) {
-            let p = data_dir().join("config.json");
-            let tmp = p.with_extension("json.tmp");
-            if std::fs::write(&tmp, b).is_ok() {
-                let _ = std::fs::rename(&tmp, &p);
-            }
+        write_json(&data_dir().join("config.json"), self);
+        if let Some(file) = automation_file() {
+            self.save_automation(&file);
         }
     }
 }
@@ -393,7 +433,24 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::glob_match;
+    use super::{Config, Priority, Rule, RuleAction, glob_match};
+
+    #[test]
+    fn protected_rules_win_over_the_user_file() {
+        let file = std::env::temp_dir().join(format!("sentinel-automation-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let rule = |p: &str| Rule { id: 1, enabled: true, pattern: p.into(), action: RuleAction::SetPriority(Priority::BelowNormal) };
+        let mut first = Config { rules: vec![rule("mine.exe")], ..Default::default() };
+        first.apply_automation(&file); // first start: created from the user's rules
+        let mut tampered = Config { rules: vec![rule("antivirus.exe")], ..Default::default() };
+        tampered.apply_automation(&file);
+        assert_eq!(tampered.rules.len(), 1);
+        assert_eq!(tampered.rules[0].pattern, "mine.exe");
+        std::fs::write(&file, "broken").unwrap();
+        tampered.apply_automation(&file);
+        assert!(tampered.rules.is_empty());
+        let _ = std::fs::remove_file(&file);
+    }
     #[test]
     fn globs() {
         assert!(glob_match("chrome.exe", "Chrome.EXE"));

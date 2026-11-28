@@ -215,7 +215,8 @@ impl App {
                 AppAct::Uninstall(app, quiet) => self.start_uninstall(app, quiet),
                 AppAct::Remove(list) => self.modal = Some(Modal::RemoveApps(list)),
                 AppAct::OpenFolder(p) => {
-                    let _ = crate::win::shell_open(&p, "", "");
+                    // The path comes from the registry, which any program can write: open it without admin rights.
+                    let _ = crate::win::launch_as_user(&p, "", None);
                 }
                 AppAct::Regedit(app) => apps::show_in_regedit(&app),
                 AppAct::Copy(t) => self.copy(&ctx, t),

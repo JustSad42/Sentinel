@@ -425,7 +425,8 @@ pub fn recycle(paths: &[String]) -> Result<(), String> {
     let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
     op.wFunc = FO_DELETE;
     op.pFrom = buf.as_ptr();
-    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI) as u16;
+    // NUKEWARNING: ask before a delete that can't be recycled (network or removable drive)
+    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING) as u16;
     let r = unsafe { SHFileOperationW(&mut op) };
     if r == 0 && op.fAnyOperationsAborted == 0 { Ok(()) } else if r == 5 || r == 0x78 { Err("Access denied".into()) } else { Err(format!("Could not delete (code {r})")) }
 }
@@ -492,23 +493,55 @@ pub fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+fn windows_explorer() -> String {
+    let mut buf = [0u16; 260];
+    let n = unsafe { windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    format!("{}\\explorer.exe", String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())]))
+}
+
+fn is_program(target: &str) -> bool {
+    let t = target.trim_matches('"').to_ascii_lowercase();
+    !t.contains("://") && !Path::new(&t).is_dir() && (t.ends_with(".exe") || t.ends_with(".bat") || t.ends_with(".cmd") || !t.contains('.'))
+}
+
 /// Starts a program with the signed-in user's normal (non-admin) rights, even though Sentinel itself
-/// runs elevated: the new process is parented to Explorer and inherits its token. Falls back to a
-/// plain ShellExecute when that isn't possible (e.g. URLs, or Explorer isn't running).
+/// runs elevated: the new process is parented to Explorer and inherits its token. Targets come from
+/// files and registry keys any program can edit, so there is no falling back to an elevated start.
 pub fn launch_as_user(exe: &str, args: &str, cwd: Option<&str>) -> Result<(), String> {
-    let looks_like_program = !exe.contains("://") && (exe.to_ascii_lowercase().ends_with(".exe") || !exe.contains('.'));
-    if !is_elevated() || !looks_like_program {
+    if !is_elevated() {
         return shell_open(exe, args, "");
     }
+    // A URL, document or shortcut: Explorer opens it.
+    if !is_program(exe) {
+        return match create_as_shell(&windows_explorer(), &format!("\"{}\"", exe.trim_matches('"')), None) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(format!("Could not open it (error {e})")),
+        };
+    }
+    match create_as_shell(exe, args, cwd) {
+        Ok(()) => Ok(()),
+        // It asks for admin itself: let Explorer start it, which shows the usual UAC prompt.
+        Err(ERROR_ELEVATION_REQUIRED) if args.is_empty() => {
+            create_as_shell(&windows_explorer(), &format!("\"{}\"", exe.trim_matches('"')), None).map_err(|e| format!("Could not start it (error {e})"))
+        }
+        // No desktop shell to borrow rights from, and the thing to start is the shell itself.
+        Err(_) if exe.trim_matches('"').eq_ignore_ascii_case(&windows_explorer()) => shell_open(exe, args, ""),
+        Err(ERROR_ELEVATION_REQUIRED) => Err("It needs admin rights; start it yourself".into()),
+        Err(e) => Err(format!("Could not start it without admin rights (error {e})")),
+    }
+}
+
+/// `CreateProcessW` with the desktop shell as parent. The error is the Win32 error code.
+fn create_as_shell(exe: &str, args: &str, cwd: Option<&str>) -> Result<(), u32> {
     unsafe {
         let shell = GetShellWindow();
         let mut pid = 0u32;
         if shell.is_null() || GetWindowThreadProcessId(shell, &mut pid) == 0 || pid == 0 {
-            return shell_open(exe, args, "");
+            return Err(ERROR_NOT_FOUND);
         }
         let hp = OpenProcess(PROCESS_CREATE_PROCESS, 0, pid);
         if hp.is_null() {
-            return shell_open(exe, args, "");
+            return Err(GetLastError());
         }
         let hp = Handle(hp);
         let mut size = 0usize;
@@ -516,13 +549,13 @@ pub fn launch_as_user(exe: &str, args: &str, cwd: Option<&str>) -> Result<(), St
         let mut buf = vec![0u8; size.max(64)];
         let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
         if InitializeProcThreadAttributeList(list, 1, 0, &mut size) == 0 {
-            return shell_open(exe, args, "");
+            return Err(GetLastError());
         }
         let mut parent = hp.0;
-        let ok = UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize, &mut parent as *mut HANDLE as *const c_void, std::mem::size_of::<HANDLE>(), std::ptr::null_mut(), std::ptr::null());
-        if ok == 0 {
+        if UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize, &mut parent as *mut HANDLE as *const c_void, std::mem::size_of::<HANDLE>(), std::ptr::null_mut(), std::ptr::null()) == 0 {
+            let e = GetLastError();
             DeleteProcThreadAttributeList(list);
-            return shell_open(exe, args, "");
+            return Err(e);
         }
         let mut si: STARTUPINFOEXW = std::mem::zeroed();
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -543,10 +576,10 @@ pub fn launch_as_user(exe: &str, args: &str, cwd: Option<&str>) -> Result<(), St
             &si.StartupInfo,
             &mut pi,
         );
+        let e = GetLastError();
         DeleteProcThreadAttributeList(list);
         if ok == 0 {
-            let e = last_error();
-            return shell_open(exe, args, "").map_err(|_| format!("Could not start it (error {e})"));
+            return Err(e);
         }
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
@@ -570,4 +603,19 @@ pub fn set_cloaked(hwnd: isize, on: bool) -> bool {
     }
     let v: i32 = on as i32;
     unsafe { windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(hwnd as _, 13, &v as *const _ as *const _, 4) == 0 }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    #[test]
+    fn what_counts_as_a_program() {
+        use super::is_program;
+        assert!(is_program(r"C:\a\b.EXE"));
+        assert!(is_program(r"C:\a\job.bat"));
+        assert!(is_program("notepad"));
+        assert!(!is_program("https://example.com/x.exe"));
+        assert!(!is_program(r"C:\a\notes.txt"));
+        assert!(!is_program(r"C:\a\link.lnk"));
+        assert!(!is_program(r"C:\Windows\System32"), "a folder is opened, not run");
+    }
 }

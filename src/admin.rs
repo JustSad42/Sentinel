@@ -84,6 +84,7 @@ fn execute(op: &AdminOp) -> Result<(), String> {
             let root = hklm(false, 0)?;
             let (k, _) = root.create_subkey_with_flags(IFEO_KEY, KEY_ALL_ACCESS | KEY_WOW64_64KEY).map_err(|e| e.to_string())?;
             if *enable {
+                require_installed(exe)?;
                 k.set_value("Debugger", &format!("\"{exe}\" --ifeo")).map_err(|e| e.to_string())
             } else {
                 match k.delete_value("Debugger") {
@@ -112,6 +113,11 @@ fn execute(op: &AdminOp) -> Result<(), String> {
         AdminOp::Firewall { block, path } => firewall(*block, path),
         AdminOp::CloseTcp { local, remote } => crate::net::close_tcp(local.parse().map_err(|_| "bad address")?, remote.parse().map_err(|_| "bad address")?),
     }
+}
+
+/// Anything that starts Sentinel elevated without a prompt must point at the installed copy.
+fn require_installed(exe: &str) -> Result<(), String> {
+    if crate::install::is_protected(exe) { Ok(()) } else { Err("Only the copy installed in Program Files can do that".into()) }
 }
 
 fn xml_escape(s: &str) -> String {
@@ -169,6 +175,7 @@ pub fn logon_task_enabled() -> bool {
 /// The elevated launch task: exists, points at this exe, and has a logon trigger iff `at_logon`.
 /// Needs admin. Running it later (`run_task`) needs no UAC prompt.
 pub fn ensure_task(exe: &str, at_logon: bool) -> Result<(), String> {
+    require_installed(exe)?;
     if let Some(x) = task_xml() {
         if x.contains(&xml_escape(exe)) && x.contains("<LogonTrigger>") == at_logon {
             return Ok(());
@@ -200,7 +207,8 @@ pub fn ensure_task(exe: &str, at_logon: bool) -> Result<(), String> {
         user = xml_escape(&user),
         exe = xml_escape(exe)
     );
-    let path = std::env::temp_dir().join("sentinel-task.xml");
+    // Beside the installed exe, where nothing unelevated can rewrite it before schtasks reads it.
+    let path = std::path::Path::new(exe).with_file_name("task.xml");
     let utf16: Vec<u8> = std::iter::once(0xFEFFu16).chain(xml.encode_utf16()).flat_map(|c| c.to_le_bytes()).collect();
     std::fs::write(&path, utf16).map_err(|e| e.to_string())?;
     let out = std::process::Command::new("schtasks.exe").creation_flags(0x0800_0000).args(["/Create", "/TN", "Sentinel", "/XML"]).arg(&path).arg("/F").output().map_err(|e| e.to_string())?;

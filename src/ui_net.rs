@@ -70,7 +70,7 @@ impl App {
                     }
                 }
                 NetAct::Lookup(ip) => {
-                    let _ = crate::win::shell_open(&format!("https://ipinfo.io/{ip}"), "", "");
+                    let _ = crate::win::launch_as_user(&format!("https://ipinfo.io/{ip}"), "", None);
                 }
             }
         }

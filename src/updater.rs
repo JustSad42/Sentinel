@@ -13,7 +13,8 @@ pub enum State {
     Checking,
     UpToDate,
     Downloading(String),
-    Ready { version: String, notes: String, path: std::path::PathBuf },
+    /// The verified download stays in memory: a file on disk could be swapped before it is installed.
+    Ready { version: String, notes: String, exe: Arc<Vec<u8>> },
     Error(String),
 }
 
@@ -72,11 +73,7 @@ pub fn check(state: &Shared) {
         if actual != expected {
             return Err("Downloaded update failed the checksum, discarded".into());
         }
-        let dir = crate::config::data_dir().join("update");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!("Sentinel-{version}.exe"));
-        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-        Ok(State::Ready { version, notes: rel.body, path })
+        Ok(State::Ready { version, notes: rel.body, exe: Arc::new(bytes) })
     })();
     *state.lock().unwrap() = match res {
         Ok(s) => s,
@@ -84,17 +81,28 @@ pub fn check(state: &Shared) {
     };
 }
 
-/// Replaces the running exe with the downloaded one and starts it. The caller then exits.
-pub fn apply(path: &std::path::Path, show: bool) -> Result<(), String> {
-    let cur = std::env::current_exe().map_err(|e| e.to_string())?;
-    let old = cur.with_extension("old.exe");
+/// Puts `bytes` at `target`, keeping the file that was there (it may be running) as `.old.exe`.
+pub fn replace(target: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let old = target.with_extension("old.exe");
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&cur, &old).map_err(|e| format!("Could not replace the app: {e}"))?;
-    if let Err(e) = std::fs::copy(path, &cur) {
-        let _ = std::fs::rename(&old, &cur);
+    let had = target.exists();
+    if had {
+        std::fs::rename(target, &old).map_err(|e| format!("Could not replace the app: {e}"))?;
+    }
+    if let Err(e) = std::fs::write(target, bytes) {
+        if had {
+            let _ = std::fs::rename(&old, target);
+        }
         return Err(format!("Could not install the update: {e}"));
     }
-    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// Replaces the running exe with the downloaded one and starts it. The caller then exits.
+pub fn apply(exe: &[u8], show: bool) -> Result<(), String> {
+    let cur = std::env::current_exe().map_err(|e| e.to_string())?;
+    replace(&cur, exe)?;
+    // The new copy records its own version when it starts.
     let mut cmd = std::process::Command::new(&cur);
     cmd.arg("--takeover").arg("--updated");
     if !show {
@@ -133,5 +141,17 @@ mod tests {
         assert!(super::newer("v1.2.0", "1.1.9"));
         assert!(super::newer("1.10.0", "1.9.0"));
         assert!(!super::newer("v1.0.0", "1.0.0"));
+    }
+
+    #[test]
+    fn replace_keeps_the_old_file() {
+        let d = std::env::temp_dir().join(format!("sentinel-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let t = d.join("Sentinel.exe");
+        super::replace(&t, b"one").unwrap();
+        super::replace(&t, b"two").unwrap();
+        assert_eq!(std::fs::read(&t).unwrap(), b"two");
+        assert_eq!(std::fs::read(t.with_extension("old.exe")).unwrap(), b"one");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

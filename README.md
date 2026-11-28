@@ -35,7 +35,7 @@ These were taken from a test copy started without admin rights, so the sidebar s
 .\install.ps1
 ```
 
-This builds a release, copies it to `%LOCALAPPDATA%\Programs\Sentinel`, and adds a Start menu shortcut.
+This builds a release, copies it to `%ProgramFiles%\Sentinel` (one UAC prompt), and adds a Start menu shortcut.
 
 The first start asks for admin once. Sentinel then registers a scheduled task so later starts are elevated with no prompt, including at sign-in. In **Settings**, turn on **Replace Windows Task Manager** to make every Task Manager entry point open Sentinel.
 

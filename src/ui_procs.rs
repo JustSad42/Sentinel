@@ -1127,7 +1127,7 @@ impl App {
             Act::Copy(t) => self.copy(ctx, t),
             Act::Search(n) => {
                 let q: String = n.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '+' }).collect();
-                let _ = win::shell_open(&format!("https://duckduckgo.com/?q={q}+process"), "", "");
+                let _ = win::launch_as_user(&format!("https://duckduckgo.com/?q={q}+process"), "", None);
             }
             Act::Block(path) => self.toggle_block(path),
             Act::Sort(c) => self.toggle_sort(Some(c)),

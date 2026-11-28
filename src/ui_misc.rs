@@ -1164,9 +1164,9 @@ impl App {
                 };
                 setting_row(ui, &status, &format!("github.com/{}", updater::REPO), |ui| {
                     match st {
-                        updater::State::Ready { path, .. } => {
+                        updater::State::Ready { exe, .. } => {
                             if button(ui, Btn::Primary, I::ARROWS_CLOCKWISE, "Restart and update", true).clicked() {
-                                self.apply_update(ui.ctx(), &path, true);
+                                self.apply_update(ui.ctx(), &exe, true);
                             }
                         }
                         updater::State::Checking | updater::State::Downloading(_) => spinner(ui, 18.0, ACCENT_HI()),
@@ -1194,10 +1194,10 @@ impl App {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if button(ui, Btn::Ghost, I::FOLDER_OPEN, "Open data folder", true).clicked() {
-                        let _ = win::shell_open(&crate::config::data_dir().to_string_lossy(), "", "");
+                        let _ = win::launch_as_user(&crate::config::data_dir().to_string_lossy(), "", None);
                     }
                     if button(ui, Btn::Ghost, I::ARROW_SQUARE_OUT, "GitHub", true).clicked() {
-                        let _ = win::shell_open(&format!("https://github.com/{}", updater::REPO), "", "");
+                        let _ = win::launch_as_user(&format!("https://github.com/{}", updater::REPO), "", None);
                     }
                     if button(ui, Btn::Danger, I::POWER, "Quit Sentinel", true).on_hover_text("Ctrl+Q. Ctrl+Shift+Esc won't work until it starts again.").clicked() {
                         self.quit(ui.ctx());

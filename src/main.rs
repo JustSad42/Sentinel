@@ -15,6 +15,7 @@ mod graph;
 mod hw;
 mod icons;
 mod info;
+mod install;
 mod integration;
 mod net;
 mod overlay;
@@ -103,6 +104,26 @@ fn main() -> eframe::Result<()> {
         }
         // UAC declined: run with limited rights rather than not at all.
         instance = integration::acquire(true);
+    }
+
+    // Elevated copies run only from Program Files: install there first, then carry on from it.
+    if win::is_elevated() && !integration::is_dev_build() {
+        match install::ensure() {
+            Ok(Some(installed)) => {
+                drop(instance.take());
+                let mut cmd = std::process::Command::new(&installed);
+                cmd.args(args[1..].iter().filter(|a| *a != "--takeover")).arg("--takeover");
+                match cmd.spawn() {
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        integration::log_launch(&format!("couldn't start the installed copy: {e}"));
+                        instance = integration::acquire(true);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => integration::log_launch(&format!("couldn't install to Program Files: {e}")),
+        }
     }
 
     hw::warm();
