@@ -43,5 +43,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # v1.3.0 changes how the app installs and was never upgraded on a real PC: installed copies only see it
+          # once it is marked "latest" by hand (Releases page, edit, untick pre-release).
+          $pre = @(if ("${{ github.ref_name }}" -eq "v1.3.0") { "--prerelease" })
           gh release create "${{ github.ref_name }}" out/Sentinel.exe out/Sentinel.exe.sha256 `
-            --title "Sentinel ${{ github.ref_name }}" --notes-from-tag
+            --title "Sentinel ${{ github.ref_name }}" --notes-from-tag @pre
